@@ -878,7 +878,10 @@ static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
 		printf("Resetting boot count of image slot %u to 0\n", slot);
-		dual_boot_set_boot_count(slot, 0);
+		ret = dual_boot_set_boot_count(slot, 0);
+		if (ret)
+			printf("Warning: failed to reset boot count of image slot %u, error %d\n",
+			       slot, ret);
 	}
 
 	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
@@ -1703,3 +1706,4 @@ void mtd_boot_set_defaults(void *fdt)
 		rootdisk_set_rootfs_ubi_relax(fdt, ubi_image_vol);
 #endif
 }
+

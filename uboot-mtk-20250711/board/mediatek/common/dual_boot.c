@@ -23,6 +23,7 @@
 
 #define MTK_SIP_READ_NONRST_REG			0xC2000570
 #define MTK_SIP_WRITE_NONRST_REG		0xC2000571
+#define MTK_SIP_SMC_UNK				0xffffffff
 
 const struct dual_boot_slot dual_boot_slots[DUAL_BOOT_MAX_SLOTS] = {
 	{
@@ -52,6 +53,7 @@ const struct dual_boot_slot dual_boot_slots[DUAL_BOOT_MAX_SLOTS] = {
 };
 
 static bool dual_boot_disabled;
+static int dual_boot_nonrst_supported = -1;
 
 static char boot_image_slot[16];
 static char upgrade_image_slot[16];
@@ -73,6 +75,12 @@ u32 dual_boot_get_current_slot(void)
 	if (end == slot_str || *end) {
 		printf("Invalid image slot number '%s', default to 0\n",
 		       slot_str);
+		return 0;
+	}
+
+	if (slot >= DUAL_BOOT_MAX_SLOTS) {
+		printf("Image slot number %lu is out of range, default to 0\n",
+		       slot);
 		return 0;
 	}
 
@@ -147,18 +155,10 @@ int dual_boot_set_slot_invalid(u32 slot, bool invalid, bool save)
 	return ret;
 }
 
-bool dual_boot_get_boot_count(u32 *retslot, u32 *retcnt)
+static bool dual_boot_decode_boot_count(u32 val, u32 *retslot, u32 *retcnt)
 {
-#ifdef CONFIG_ARCH_MEDIATEK
-	struct arm_smccc_res res = {0};
-	u32 val, slot;
+	u32 slot;
 	s8 neg, pos;
-
-	arm_smccc_smc(MTK_SIP_READ_NONRST_REG, 0, 0, 0, 0, 0, 0, 0, &res);
-
-	val = (u32)res.a0;
-
-	pr_debug("read boot count: 0x%08x\n", val);
 
 	/* slot: val[31..24] = -slot, val[23..16] = slot */
 	pos = (val >> 16) & 0xff;
@@ -191,8 +191,6 @@ bool dual_boot_get_boot_count(u32 *retslot, u32 *retcnt)
 	return true;
 
 err:
-#endif
-
 	if (retslot)
 		*retslot = 0;
 
@@ -202,15 +200,78 @@ err:
 	return false;
 }
 
-void dual_boot_set_boot_count(u32 slot, u32 count)
+static bool dual_boot_read_boot_count_raw(u32 *retraw)
 {
 #ifdef CONFIG_ARCH_MEDIATEK
 	struct arm_smccc_res res = {0};
-	u32 val;
+
+	arm_smccc_smc(MTK_SIP_READ_NONRST_REG, 0, 0, 0, 0, 0, 0, 0, &res);
+
+	*retraw = (u32)res.a0;
+	pr_debug("read boot count: 0x%08x\n", *retraw);
+
+	if (*retraw == MTK_SIP_SMC_UNK)
+		return false;
+
+	return true;
+#else
+	*retraw = 0;
+	return false;
+#endif
+}
+
+static bool dual_boot_nonrst_is_supported(void)
+{
+	u32 raw;
+
+	if (dual_boot_nonrst_supported >= 0)
+		return dual_boot_nonrst_supported;
+
+	if (!dual_boot_read_boot_count_raw(&raw)) {
+		printf("Non-reset SMC is not supported. Retry will be disabled.\n");
+		dual_boot_nonrst_supported = 0;
+		return false;
+	}
+
+	dual_boot_nonrst_supported = 1;
+	return true;
+}
+
+bool dual_boot_get_boot_count(u32 *retslot, u32 *retcnt)
+{
+	u32 raw;
+
+	if (!dual_boot_nonrst_is_supported())
+		goto err;
+
+	if (!dual_boot_read_boot_count_raw(&raw))
+		goto err;
+
+	return dual_boot_decode_boot_count(raw, retslot, retcnt);
+
+err:
+	if (retslot)
+		*retslot = 0;
+
+	if (retcnt)
+		*retcnt = 0;
+
+	return false;
+}
+
+int dual_boot_set_boot_count(u32 slot, u32 count)
+{
+#ifdef CONFIG_ARCH_MEDIATEK
+	struct arm_smccc_res res = {0};
+	u32 val, verify_raw;
+	u32 verify_slot = 0, verify_count = 0;
 	s32 neg;
 
 	if (slot > 127 || count > 127)
-		return;
+		return -EINVAL;
+
+	if (!dual_boot_nonrst_is_supported())
+		return -EOPNOTSUPP;
 
 	pr_debug("Set boot count: %u of slot %u\n", count, slot);
 
@@ -223,6 +284,24 @@ void dual_boot_set_boot_count(u32 slot, u32 count)
 	pr_debug("write boot count: 0x%08x\n", val);
 
 	arm_smccc_smc(MTK_SIP_WRITE_NONRST_REG, 0, val, 0, 0, 0, 0, 0, &res);
+
+	if (!dual_boot_read_boot_count_raw(&verify_raw)) {
+		printf("Failed to verify boot count write: non-reset SMC unavailable\n");
+		dual_boot_nonrst_supported = 0;
+		return -EIO;
+	}
+
+	if (!dual_boot_decode_boot_count(verify_raw, &verify_slot, &verify_count) ||
+	    verify_slot != slot || verify_count != count) {
+		printf("Failed to verify boot count write: expected slot %u count %u, got raw 0x%08x\n",
+		       slot, count, verify_raw);
+		dual_boot_nonrst_supported = 0;
+		return -EIO;
+	}
+
+	return 0;
+#else
+	return -EOPNOTSUPP;
 #endif
 }
 
@@ -237,15 +316,6 @@ int dual_boot(struct dual_boot_priv *priv, bool do_boot)
 		u32 last_slot;
 		bool bcvalid;
 
-		bcvalid = dual_boot_get_boot_count(&last_slot, &bootcount);
-
-		if (!bcvalid || slot != last_slot) {
-#ifdef CONFIG_ARCH_MEDIATEK
-			printf("Boot count is invalid. Assuming cold boot\n");
-#endif
-			bootcount = 0;
-		}
-
 		/* Avoid compilation error */
 #ifdef CONFIG_MTK_DUAL_BOOT_MAX_RETRY_COUNT
 		maxcount = CONFIG_MTK_DUAL_BOOT_MAX_RETRY_COUNT;
@@ -253,6 +323,18 @@ int dual_boot(struct dual_boot_priv *priv, bool do_boot)
 
 		if (maxcount < 1)
 			maxcount = 1;
+
+		bcvalid = dual_boot_get_boot_count(&last_slot, &bootcount);
+
+		if (!dual_boot_nonrst_is_supported()) {
+			maxcount = 0;
+			bootcount = 0;
+		} else if (!bcvalid || slot != last_slot) {
+#ifdef CONFIG_ARCH_MEDIATEK
+			printf("Boot count is invalid. Assuming cold boot\n");
+#endif
+			bootcount = 0;
+		}
 	}
 
 	if (dual_boot_is_slot_invalid(slot)) {
@@ -270,7 +352,11 @@ int dual_boot(struct dual_boot_priv *priv, bool do_boot)
 			if (maxcount) {
 				printf("Setting image slot %u with boot count %u\n",
 				       slot, bootcount + 1);
-				dual_boot_set_boot_count(slot, bootcount + 1);
+				if (dual_boot_set_boot_count(slot, bootcount + 1)) {
+					printf("Failed to persist boot count for image slot %u\n",
+					       slot);
+					maxcount = 0;
+				}
 			}
 
 			ret = priv->boot_slot(priv, slot, do_boot);
@@ -300,7 +386,11 @@ int dual_boot(struct dual_boot_priv *priv, bool do_boot)
 
 		if (maxcount) {
 			printf("Setting image slot %u with boot count 1\n", slot);
-			dual_boot_set_boot_count(slot, 1);
+			if (dual_boot_set_boot_count(slot, 1)) {
+				printf("Failed to persist boot count for image slot %u\n",
+				       slot);
+				maxcount = 0;
+			}
 		}
 
 		ret = priv->boot_slot(priv, slot, do_boot);
@@ -348,13 +438,11 @@ static int dual_boot_set_fdt_defaults(void *fdt)
 	slot = dual_boot_get_current_slot();
 	rootdisk_set_fitblk_rootfs(fdt, dual_boot_slots[slot].kernel);
 
-	snprintf(boot_image_slot, sizeof(boot_image_slot), "%u", slot);
-	if (fdtargs_set("mediatek,boot-image-slot", boot_image_slot))
+	if (fdtargs_set_u32("mediatek,boot-image-slot", slot))
 		return -1;
 
 	slot = dual_boot_get_next_slot();
-	snprintf(upgrade_image_slot, sizeof(upgrade_image_slot), "%u", slot);
-	if (fdtargs_set("mediatek,upgrade-image-slot", upgrade_image_slot))
+	if (fdtargs_set_u32("mediatek,upgrade-image-slot", slot))
 		return -1;
 
 	if (fdtargs_set("mediatek,dual-boot", NULL))
@@ -385,3 +473,4 @@ int dual_boot_set_defaults(void *fdt)
 
 	return ret;
 }
+

@@ -27,7 +27,7 @@ bool dual_boot_is_slot_invalid(u32 slot);
 int dual_boot_set_slot_invalid(u32 slot, bool invalid, bool save);
 
 bool dual_boot_get_boot_count(u32 *retslot, u32 *retcnt);
-void dual_boot_set_boot_count(u32 slot, u32 count);
+int dual_boot_set_boot_count(u32 slot, u32 count);
 
 int dual_boot_set_defaults(void *fdt);
 
@@ -46,3 +46,4 @@ struct dual_boot_priv {
 int dual_boot(struct dual_boot_priv *priv, bool do_boot);
 
 #endif /* _DUAL_BOOT_H_ */
+

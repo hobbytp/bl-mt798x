@@ -30,12 +30,33 @@ struct arg_list {
 	u32 used;
 };
 
+enum fdt_arg_type {
+	FDT_ARG_EMPTY = 0,
+	FDT_ARG_STRING,
+	FDT_ARG_U32,
+};
+
+struct fdt_arg_pair {
+	const char *key;
+	const char *value;
+	u32 u32_value;
+	enum fdt_arg_type type;
+};
+
+struct fdt_arg_list {
+	const char *name;
+	struct fdt_arg_pair *ap;
+	u32 max;
+	u32 used;
+};
+
 void bootargs_reset(void);
 int bootargs_set(const char *key, const char *value);
 void bootargs_unset(const char *key);
 
 void fdtargs_reset(void);
 int fdtargs_set(const char *prop, const char *value);
+int fdtargs_set_u32(const char *prop, u32 value);
 void fdtargs_unset(const char *prop);
 
 void list_all_args(const char *args);
@@ -45,3 +66,4 @@ const char *get_arg_next(const char *args, const char **param,
 			 size_t *keylen);
 
 #endif /* _BOOT_HELPER_H_ */
+

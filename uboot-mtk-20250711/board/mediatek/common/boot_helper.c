@@ -14,6 +14,7 @@
 #include <linux/types.h>
 #include <linux/sizes.h>
 #include <linux/ctype.h>
+#include <linux/libfdt.h>
 #include <linux/string.h>
 
 #include "upgrade_helper.h"
@@ -31,7 +32,7 @@ struct bootconf_list {
 };
 
 static struct arg_list bootargs = { .name = "bootargs" };
-static struct arg_list fdtargs = { .name = "fdtargs" };
+static struct fdt_arg_list fdtargs = { .name = "fdtargs" };
 
 static int bootconf_list_expand(struct bootconf_list *list)
 {
@@ -317,6 +318,29 @@ static int arg_list_expand(struct arg_list *arglist)
 	return 0;
 }
 
+static int fdt_arg_list_expand(struct fdt_arg_list *arglist)
+{
+	struct fdt_arg_pair *newptr;
+
+	if (!arglist->ap) {
+		newptr = malloc(ARGLIST_INCR * sizeof(*arglist->ap));
+		arglist->used = 0;
+		arglist->max = 0;
+	} else {
+		newptr = realloc(arglist->ap,
+				 (arglist->max + ARGLIST_INCR) *
+				 sizeof(*arglist->ap));
+	}
+
+	if (!newptr)
+		return -ENOMEM;
+
+	arglist->ap = newptr;
+	arglist->max += ARGLIST_INCR;
+
+	return 0;
+}
+
 static int arg_list_set(struct arg_list *arglist, const char *key,
 			const char *value)
 {
@@ -334,7 +358,45 @@ static int arg_list_set(struct arg_list *arglist, const char *key,
 	return 0;
 }
 
+static int fdt_arg_list_set(struct fdt_arg_list *arglist, const char *key,
+			    const char *value, u32 u32_value,
+			    enum fdt_arg_type type)
+{
+	if (arglist->used == arglist->max) {
+		if (fdt_arg_list_expand(arglist)) {
+			panic("Error: No space for %s\n", arglist->name);
+			return -1;
+		}
+	}
+
+	arglist->ap[arglist->used].key = key;
+	arglist->ap[arglist->used].value = value;
+	arglist->ap[arglist->used].u32_value = u32_value;
+	arglist->ap[arglist->used].type = type;
+	arglist->used++;
+
+	return 0;
+}
+
 static void arg_list_remove(struct arg_list *arglist, const char *key)
+{
+	u32 i;
+
+	for (i = 0; i < arglist->used; i++) {
+		if (strcmp(arglist->ap[i].key, key))
+			continue;
+
+		if (i < arglist->used - 1) {
+			memmove(&arglist->ap[i], &arglist->ap[i + 1],
+				(arglist->used - i - 1) * sizeof(*arglist->ap));
+		}
+
+		arglist->used--;
+		break;
+	}
+}
+
+static void fdt_arg_list_remove(struct fdt_arg_list *arglist, const char *key)
 {
 	u32 i;
 
@@ -374,12 +436,19 @@ void fdtargs_reset(void)
 
 int fdtargs_set(const char *prop, const char *value)
 {
-	return arg_list_set(&fdtargs, prop, value);
+	enum fdt_arg_type type = value ? FDT_ARG_STRING : FDT_ARG_EMPTY;
+
+	return fdt_arg_list_set(&fdtargs, prop, value, 0, type);
+}
+
+int fdtargs_set_u32(const char *prop, u32 value)
+{
+	return fdt_arg_list_set(&fdtargs, prop, NULL, value, FDT_ARG_U32);
 }
 
 void fdtargs_unset(const char *prop)
 {
-	arg_list_remove(&fdtargs, prop);
+	fdt_arg_list_remove(&fdtargs, prop);
 }
 
 #ifdef CONFIG_MTK_SECURE_BOOT
@@ -565,27 +634,46 @@ static int cmdline_merge(const char *cmdline, const struct arg_pair *bootargs,
 	return 1;
 }
 
-static int fdt_root_prop_merge(void *fdt)
+static int fdt_chosen_prop_merge(void *fdt)
 {
 	int ret, np, len;
 	u32 i;
+	fdt32_t value;
 
 	for (i = 0; i < fdtargs.used; i++) {
-		np = fdt_path_offset(fdt, "/");
+		np = fdt_find_or_add_subnode(fdt, 0, "chosen");
 		if (np < 0)
 			return -ENOENT;
 
-		if (fdtargs.ap[i].value)
+		switch (fdtargs.ap[i].type) {
+		case FDT_ARG_U32:
+			len = sizeof(value);
+			value = cpu_to_fdt32(fdtargs.ap[i].u32_value);
+			ret = fdt_setprop(fdt, np, fdtargs.ap[i].key,
+					  &value, len);
+			break;
+		case FDT_ARG_STRING:
 			len = strlen(fdtargs.ap[i].value) + 1;
-		else
+			ret = fdt_setprop(fdt, np, fdtargs.ap[i].key,
+					  fdtargs.ap[i].value, len);
+			break;
+		case FDT_ARG_EMPTY:
 			len = 0;
+			ret = fdt_setprop(fdt, np, fdtargs.ap[i].key,
+					  NULL, 0);
+			break;
+		default:
+			return -EINVAL;
+		}
 
-		ret = fdt_setprop(fdt, np, fdtargs.ap[i].key,
-				  fdtargs.ap[i].value, len);
 		if (ret < 0) {
-			if (len) {
+			if (fdtargs.ap[i].type == FDT_ARG_STRING) {
 				printf("Failed to set prop '%s = \"%s\"' in FDT",
 				       fdtargs.ap[i].key, fdtargs.ap[i].value);
+			} else if (fdtargs.ap[i].type == FDT_ARG_U32) {
+				printf("Failed to set prop '%s = <%u>' in FDT",
+				       fdtargs.ap[i].key,
+				       fdtargs.ap[i].u32_value);
 			} else {
 				printf("Failed to set prop '%s' in FDT",
 				       fdtargs.ap[i].key);
@@ -656,11 +744,12 @@ void board_prep_linux(struct bootm_headers *images)
 		}
 	}
 
-	ret = fdt_root_prop_merge(fdt);
+	ret = fdt_chosen_prop_merge(fdt);
 	if (ret) {
-		panic("Error: failed to set FDT root props\n");
+		panic("Error: failed to set /chosen props\n");
 		return;
 	}
 
 	fdt_shrink_to_minimum(fdt, 0);
 }
+
