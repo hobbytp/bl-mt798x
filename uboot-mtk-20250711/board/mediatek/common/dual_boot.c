@@ -329,9 +329,15 @@ int dual_boot(struct dual_boot_priv *priv, bool do_boot)
 		if (!dual_boot_nonrst_is_supported()) {
 			maxcount = 0;
 			bootcount = 0;
-		} else if (!bcvalid || slot != last_slot) {
+		} else if (!bcvalid) {
 #ifdef CONFIG_ARCH_MEDIATEK
 			printf("Boot count is invalid. Assuming cold boot\n");
+#endif
+			bootcount = 0;
+		} else if (slot != last_slot) {
+#ifdef CONFIG_ARCH_MEDIATEK
+			printf("Boot count belongs to image slot %u, current image slot is %u. Assuming cold boot\n",
+			       last_slot, slot);
 #endif
 			bootcount = 0;
 		}
