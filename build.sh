@@ -63,7 +63,7 @@ if [ -z "$SOC" ] || [ -z "$BOARD" ]; then
 	echo "eg: SOC=mt7981 BOARD=wr30u MULTI_LAYOUT=1 $0"
 	echo "eg: SOC=mt7981 BOARD=cmcc_rax3000m-emmc $0"
 	echo "eg: SOC=mt7981 BOARD=z8105ax $0"
-	echo "eg: SOC=mt7981 BOARD=z8105ax UBOOT_CFG=mt7981_z8105ax_per_slot_defconfig $0"
+	echo "eg: SOC=mt7981 BOARD=z8105ax UBOOT_CFG=mt7981_z8105ax_shared_rootfs_data_defconfig $0"
 	echo "eg: SOC=mt7986 BOARD=redmi_ax6000 MULTI_LAYOUT=1 $0"
 	echo "eg: SOC=mt7986 BOARD=jdcloud_re-cp-03 $0"
 	exit 1
@@ -157,6 +157,18 @@ mkdir -p "output"
 if [ -f "$ATF_DIR/build/$SOC/release/fip.bin" ]; then
 	FIP_NAME="${SOC}_${BOARD}-fip"
 	FIP_ONLY_NAME="${SOC}_${BOARD}-fip-only"
+	if [ "$BOARD" = "z8105ax" ]; then
+		case "$UBOOT_CFG" in
+			*_shared_rootfs_data_defconfig)
+				FIP_NAME="${FIP_NAME}-shared-rootfs-data"
+				FIP_ONLY_NAME="${FIP_ONLY_NAME}-shared-rootfs-data"
+				;;
+			*)
+				FIP_NAME="${FIP_NAME}-per-slot"
+				FIP_ONLY_NAME="${FIP_ONLY_NAME}-per-slot"
+				;;
+		esac
+	fi
 	if [ "$fixedparts" = "1" ]; then
 		FIP_NAME="${FIP_NAME}-fixed-parts"
 		FIP_ONLY_NAME="${FIP_ONLY_NAME}-fixed-parts"
