@@ -5,10 +5,29 @@
  * Author: Weijie Gao <weijie.gao@mediatek.com>
  */
 
+#include <env.h>
+#include <linux/stringify.h>
+
 #include "bootmenu_common.h"
 #include "autoboot_helper.h"
 #include "mtd_helper.h"
+#include "dual_boot.h"
 #include "bsp_conf.h"
+
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+
+static void dual_boot_seed_rootfs_data_size_env(void)
+{
+	/*
+	 * CFG_EXTRA_ENV_SETTINGS provides this for a default environment.
+	 * Seed it here as well so upgraded devices with an older saved env
+	 * still expose the knob at the U-Boot prompt.
+	 */
+	if (!env_get(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV))
+		env_set(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV,
+			__stringify(CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE));
+}
+#endif
 
 static const struct data_part_entry mtd_parts[] = {
 	{
@@ -150,5 +169,10 @@ int board_late_init(void)
 		import_bsp_conf_bl2(CONFIG_TEXT_BASE);
 	}
 
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+	dual_boot_seed_rootfs_data_size_env();
+#endif
+
 	return 0;
 }
+

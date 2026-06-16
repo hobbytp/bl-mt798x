@@ -417,7 +417,7 @@ config MTK_DUAL_BOOT_ROOTFS_DATA_SIZE_LIMIT
 
 config MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
 	int "Size of rootfs_data volume (MiB)"
-	range 1 128
+	range 1 256
 	default 8
 	depends on MTK_DUAL_BOOT_ROOTFS_DATA_SIZE_LIMIT || !MTK_DUAL_BOOT_ITB_IMAGE || !MTK_DUAL_BOOT_SHARED_ROOTFS_DATA
 

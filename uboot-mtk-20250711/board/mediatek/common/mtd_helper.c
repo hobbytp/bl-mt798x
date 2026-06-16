@@ -14,10 +14,12 @@
 #include <memalign.h>
 #include <mtd.h>
 #include <ubi_uboot.h>
+#include <linux/math64.h>
 #include <linux/mtd/mtd.h>
 #include <linux/types.h>
 #include <linux/compat.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
 
 #include "load_data.h"
 #include "image_helper.h"
@@ -52,7 +54,46 @@ static char fitvol[BOOT_PARAM_STR_MAX_LEN];
 static char ubi_root_path[BOOT_PARAM_STR_MAX_LEN];
 
 #ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+#define DUAL_BOOT_ROOTFS_DATA_SIZE_MIN_MIB	64
+#define DUAL_BOOT_ROOTFS_DATA_SIZE_MAX_MIB	256
+#define DUAL_BOOT_ROOTFS_DATA_OVERSIZED_MIB	300
+
 static char rootfs_data_size_limit[BOOT_PARAM_STR_MAX_LEN];
+
+struct rootfs_data_volume_state {
+	const char *name;
+	bool exists;
+	int reserved_pebs;
+	u64 capacity_bytes;
+};
+
+static u32 dual_boot_rootfs_data_size_mib(void)
+{
+	const char *value = env_get(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV);
+	unsigned long mib;
+
+	if (value && !strict_strtoul(value, 10, &mib) &&
+	    mib >= DUAL_BOOT_ROOTFS_DATA_SIZE_MIN_MIB &&
+	    mib <= DUAL_BOOT_ROOTFS_DATA_SIZE_MAX_MIB)
+		return mib;
+
+	if (value)
+		printf("Warning: invalid %s=%s, using default %d\n",
+		       DUAL_BOOT_ROOTFS_DATA_SIZE_ENV, value,
+		       CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE);
+
+	return CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE;
+}
+
+static u64 dual_boot_rootfs_data_size_bytes(void)
+{
+	return (u64)dual_boot_rootfs_data_size_mib() << 20;
+}
+
+static u64 dual_boot_rootfs_data_oversized_bytes(void)
+{
+	return (u64)DUAL_BOOT_ROOTFS_DATA_OVERSIZED_MIB << 20;
+}
 #endif
 
 static const char *ubi_image_vol;
@@ -689,6 +730,295 @@ static int create_ubi_volume(const char *volume, u64 size, int vol_id,
 	return ret;
 }
 
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+static int ubi_target_pebs(u64 size)
+{
+	struct ubi_device *ubi = ubi_devices[0];
+
+	if (!ubi || ubi->leb_size <= 0)
+		return -ENODEV;
+
+	/*
+	 * UBI dynamic volumes on this platform use alignment 1, so the volume
+	 * usable LEB size matches the device LEB size used for creation.
+	 */
+	return div_u64(size + ubi->leb_size - 1, ubi->leb_size);
+}
+
+static void rootfs_data_read_state(const char *name,
+				   struct rootfs_data_volume_state *state)
+{
+	struct ubi_volume *vol;
+
+	memset(state, 0, sizeof(*state));
+	state->name = name;
+
+	if (!name)
+		return;
+
+	vol = ubi_find_volume((char *)name);
+	if (!vol)
+		return;
+
+	state->exists = true;
+	state->reserved_pebs = vol->reserved_pebs;
+	state->capacity_bytes = (u64)vol->reserved_pebs * vol->usable_leb_size;
+}
+
+static void rootfs_data_print_state(const struct rootfs_data_volume_state *state)
+{
+	if (!state->name) {
+		printf("A/B rootfs_data: <null> is unavailable\n");
+		return;
+	}
+
+	if (!state->exists) {
+		printf("A/B rootfs_data: %s is missing\n", state->name);
+		return;
+	}
+
+	printf("A/B rootfs_data: %s capacity %llu bytes (%d PEBs)\n",
+	       state->name, (unsigned long long)state->capacity_bytes,
+	       state->reserved_pebs);
+}
+
+static const char *rootfs_data_state_problem(
+	const struct rootfs_data_volume_state *state, u64 target_size)
+{
+	if (!state->exists)
+		return "missing";
+
+	/* Missing volumes have no meaningful size; report that first. */
+	if (state->capacity_bytes < target_size)
+		return "below target size";
+
+	if (state->capacity_bytes > dual_boot_rootfs_data_oversized_bytes())
+		return "oversized old layout";
+
+	return NULL;
+}
+
+static int rootfs_data_create_fixed(const char *name, u64 target_size)
+{
+	printf("Creating fixed volume %s of size %llu\n", name,
+	       (unsigned long long)target_size);
+
+	return create_ubi_volume(name, target_size, -1, false);
+}
+
+static int rootfs_data_check_normalize_budget(
+	const struct rootfs_data_volume_state *a,
+	const struct rootfs_data_volume_state *b,
+	u64 target_size, int count)
+{
+	struct ubi_device *ubi = ubi_devices[0];
+	int target_pebs, required_pebs, reclaimable_pebs = 0;
+	int available_pebs;
+
+	if (!ubi)
+		return -ENODEV;
+
+	target_pebs = ubi_target_pebs(target_size);
+	if (target_pebs < 0)
+		return target_pebs;
+
+	required_pebs = target_pebs * count;
+	available_pebs = ubi->avail_pebs;
+
+	if (a && a->exists)
+		reclaimable_pebs += a->reserved_pebs;
+	if (b && b->exists)
+		reclaimable_pebs += b->reserved_pebs;
+
+	printf("A/B rootfs_data budget: target=%llu bytes, required=%d PEBs, available=%d PEBs, reclaimable=%d PEBs\n",
+	       (unsigned long long)target_size, required_pebs, available_pebs,
+	       reclaimable_pebs);
+
+	if (available_pebs + reclaimable_pebs < required_pebs) {
+		cprintln(ERROR,
+			 "*** Not enough UBI space to create A/B rootfs_data volumes ***");
+		printf("A/B rootfs_data: required %d PEBs, available %d + reclaimable %d PEBs\n",
+		       required_pebs, available_pebs, reclaimable_pebs);
+		return -ENOSPC;
+	}
+
+	return 0;
+}
+
+static int rootfs_data_normalize_single(const char *name, u64 target_size,
+					const char *reason)
+{
+	struct rootfs_data_volume_state state;
+	int ret;
+
+	rootfs_data_read_state(name, &state);
+	rootfs_data_print_state(&state);
+
+	printf("Warning: normalizing shared rootfs_data layout: %s\n", reason);
+
+	ret = rootfs_data_check_normalize_budget(&state, NULL, target_size, 1);
+	if (ret)
+		return ret;
+
+	if (state.exists) {
+		ret = remove_ubi_volume(name);
+		if (ret) {
+			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+				 name, ret);
+			return ret;
+		}
+	}
+
+	ret = rootfs_data_create_fixed(name, target_size);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int rootfs_data_normalize_pair(const char *reason, const char *volume,
+				      u64 target_size)
+{
+	struct rootfs_data_volume_state rootfs_data, rootfs_data2;
+	const char *slot0_rootfs_data = dual_boot_slots[0].rootfs_data;
+	const char *slot1_rootfs_data = dual_boot_slots[1].rootfs_data;
+	int ret;
+
+	if (!slot0_rootfs_data || !slot1_rootfs_data) {
+		cprintln(ERROR, "*** A/B rootfs_data volume names are not configured ***");
+		return -EINVAL;
+	}
+
+	rootfs_data_read_state(slot0_rootfs_data, &rootfs_data);
+	rootfs_data_read_state(slot1_rootfs_data, &rootfs_data2);
+	rootfs_data_print_state(&rootfs_data);
+	rootfs_data_print_state(&rootfs_data2);
+
+	printf("Warning: A/B rootfs_data layout normalization required: %s%s%s\n",
+	       volume ? volume : "", volume ? ": " : "", reason);
+	printf("Warning: removing old rootfs_data overlay volumes and recreating both at %llu bytes\n",
+	       (unsigned long long)target_size);
+
+	ret = rootfs_data_check_normalize_budget(&rootfs_data, &rootfs_data2,
+						 target_size, 2);
+	if (ret)
+		return ret;
+
+	if (rootfs_data.exists) {
+		ret = remove_ubi_volume(slot0_rootfs_data);
+		if (ret) {
+			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+				 slot0_rootfs_data, ret);
+			return ret;
+		}
+	}
+
+	if (rootfs_data2.exists) {
+		ret = remove_ubi_volume(slot1_rootfs_data);
+		if (ret) {
+			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+				 slot1_rootfs_data, ret);
+			return ret;
+		}
+	}
+
+	ret = rootfs_data_create_fixed(slot0_rootfs_data, target_size);
+	if (ret) {
+		cprintln(ERROR,
+			 "*** CRITICAL: failed to recreate %s, A/B rootfs_data layout is incomplete ***",
+			 slot0_rootfs_data);
+		return ret;
+	}
+
+	ret = rootfs_data_create_fixed(slot1_rootfs_data, target_size);
+	if (ret) {
+		cprintln(ERROR,
+			 "*** CRITICAL: %s recreated but %s failed, A/B rootfs_data layout is incomplete ***",
+			 slot0_rootfs_data, slot1_rootfs_data);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int mtd_dual_boot_ensure_rootfs_data(u32 slot, const char *rootfs_data,
+					    bool recreate_target)
+{
+	struct rootfs_data_volume_state target_state, slot0_state, slot1_state;
+	const char *slot0_rootfs_data = dual_boot_slots[0].rootfs_data;
+	const char *slot1_rootfs_data = dual_boot_slots[1].rootfs_data;
+	const char *problem;
+	u64 target_size = dual_boot_rootfs_data_size_bytes();
+	int ret;
+
+	printf("A/B rootfs_data: preparing layout for slot %u (target volume: %s, recreate=%s)\n",
+	       slot, rootfs_data ? rootfs_data : "<null>",
+	       recreate_target ? "yes" : "no");
+	printf("A/B rootfs_data target size: %llu bytes (%u MiB), oversized threshold: %u MiB\n",
+	       (unsigned long long)target_size,
+	       dual_boot_rootfs_data_size_mib(),
+	       DUAL_BOOT_ROOTFS_DATA_OVERSIZED_MIB);
+
+	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA)) {
+		rootfs_data_read_state(rootfs_data, &target_state);
+		rootfs_data_print_state(&target_state);
+
+		problem = rootfs_data_state_problem(&target_state, target_size);
+		if (problem || recreate_target)
+			return rootfs_data_normalize_single(rootfs_data,
+							    target_size,
+							    problem ? problem :
+							    "target refresh requested");
+
+		return 0;
+	}
+
+	if (!rootfs_data || !slot0_rootfs_data || !slot1_rootfs_data)
+		return -EINVAL;
+
+	rootfs_data_read_state(slot0_rootfs_data, &slot0_state);
+	rootfs_data_read_state(slot1_rootfs_data, &slot1_state);
+	rootfs_data_print_state(&slot0_state);
+	rootfs_data_print_state(&slot1_state);
+
+	problem = rootfs_data_state_problem(&slot0_state, target_size);
+	if (problem)
+		return rootfs_data_normalize_pair(problem, slot0_state.name,
+						  target_size);
+
+	problem = rootfs_data_state_problem(&slot1_state, target_size);
+	if (problem)
+		return rootfs_data_normalize_pair(problem, slot1_state.name,
+						  target_size);
+
+	if (recreate_target && !IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
+		rootfs_data_read_state(rootfs_data, &target_state);
+
+		ret = rootfs_data_check_normalize_budget(&target_state, NULL,
+							 target_size, 1);
+		if (ret)
+			return ret;
+
+		ret = remove_ubi_volume(rootfs_data);
+		if (ret) {
+			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+				 rootfs_data, ret);
+			return ret;
+		}
+
+		ret = rootfs_data_create_fixed(rootfs_data, target_size);
+		if (ret)
+			return rootfs_data_normalize_pair("target rootfs_data refresh failed",
+							  rootfs_data,
+							  target_size);
+	}
+
+	printf("A/B rootfs_data layout is valid for slot %u\n", slot);
+
+	return 0;
+}
+#endif
+
 static int ubi_verify_volume(const char *volume, const void *data, size_t size)
 {
 	struct ubi_volume *vol;
@@ -863,11 +1193,19 @@ static int write_ubi1_tar_image(const void *data, size_t size,
 
 static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 {
-	bool rootfs_data_auto_resize = true;
+#ifndef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
 	struct ubi_volume *vol = NULL;
-	s64 rootfs_data_size = 0;
+#endif
 	int ret;
 
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+	ret = mtd_dual_boot_ensure_rootfs_data(slot, rootfs_data, true);
+	if (ret) {
+		cprintln(ERROR,
+			 "*** A/B rootfs_data layout preparation failed, not switching slot ***");
+		return ret;
+	}
+#else
 	ret = dual_boot_set_slot_invalid(slot, false, false);
 	if (ret)
 		printf("Error: failed to set new image slot valid in env\n");
@@ -892,16 +1230,26 @@ static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 	}
 
 	if (!vol) {
-#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
-		rootfs_data_auto_resize = false;
-		rootfs_data_size = CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE << 20;
+		ret = create_ubi_volume(rootfs_data, 0, -1, true);
+	}
+
+	return ret;
 #endif
 
-		ret = create_ubi_volume(rootfs_data, rootfs_data_size,
-					-1, rootfs_data_auto_resize);
+	ret = dual_boot_set_slot_invalid(slot, false, false);
+	if (ret)
+		printf("Error: failed to set new image slot valid in env\n");
 
-		if (ret == -ENOSPC && !rootfs_data_auto_resize)
-			ret = create_ubi_volume(rootfs_data, 0, -1, true);
+	ret = dual_boot_set_current_slot(slot);
+	if (ret)
+		printf("Error: failed to save new image slot to env\n");
+
+	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
+		printf("Resetting boot count of image slot %u to 0\n", slot);
+		ret = dual_boot_set_boot_count(slot, 0);
+		if (ret)
+			printf("Warning: failed to reset boot count of image slot %u, error %d\n",
+			       slot, ret);
 	}
 
 	return ret;
@@ -994,13 +1342,33 @@ static int write_ubi_itb_image(const void *data, size_t size,
 
 	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT) ||
 	    !IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+		/*
+		 * Fixed-size A/B rootfs_data is prepared by
+		 * mtd_dual_boot_ensure_rootfs_data() so it can budget before
+		 * deleting usable volumes. Keep the eager delete only for the
+		 * legacy single-boot path.
+		 */
+		if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
+			remove_ubi_volume(rootfs_data_part);
+#else
 		/* Remove this volume first in case of no enough PEBs */
 		remove_ubi_volume(rootfs_data_part);
+#endif
 	}
 
 	ret = ubi_check_reserved_volumes(false);
 	if (ret)
 		return ret;
+
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
+		ret = mtd_dual_boot_ensure_rootfs_data(slot, rootfs_data_part,
+						       false);
+		if (ret)
+			return ret;
+	}
+#endif
 
 	ret = update_ubi_volume(firmware_part, -1, data, size);
 	if (ret)
@@ -1123,7 +1491,8 @@ static int ubi_set_fdtargs_dual_boot(void)
 
 #ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
 	snprintf(rootfs_data_size_limit, sizeof(rootfs_data_size_limit),
-		 "%u", CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE << 20);
+		 "%llu",
+		 (unsigned long long)dual_boot_rootfs_data_size_bytes());
 
 	ret = fdtargs_set("mediatek,rootfs_data-size-limit",
 			  rootfs_data_size_limit);

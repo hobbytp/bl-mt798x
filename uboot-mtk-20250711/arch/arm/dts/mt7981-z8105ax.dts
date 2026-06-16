@@ -2,6 +2,7 @@
  /dts-v1/;
  #include "mt7981.dtsi"
  #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/input.h>
  
  / {
  	#address-cells = <1>;
@@ -14,6 +15,38 @@
  		stdout-path = &uart0;
  		tick-timer = &timer0;
  	};
+
+	config {
+		blink_led = "green:status";
+		system_led = "red:status";
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_red: red {
+			label = "red:status";
+			gpios = <&pio 25 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_status_green: green {
+			label = "green:status";
+			gpios = <&pio 24 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
  
  	memory@40000000 {
  		device_type = "memory";
