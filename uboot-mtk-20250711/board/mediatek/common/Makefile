@@ -40,6 +40,8 @@ obj-$(CONFIG_MTK_WEB_FAILSAFE) += failsafe.o
 
 obj-$(CONFIG_MTK_WGET) += mtk_wget.o cmd_wget.o
 
+obj-$(CONFIG_CMD_WPS_SLOT_SWITCH) += cmd_wpsslot.o
+
 endif
 
 obj-$(CONFIG_MTK_ANTI_ROLLBACK) += mtk_ar.o mtk_efuse.o
@@ -52,3 +54,4 @@ obj-$(CONFIG_MTK_MISC_CUSTOMIZED) += customizations/
 
 obj-$(CONFIG_MTK_FW_ENCRYPT_VIA_BL31) += mtk_aes_decrypt.o
 obj-$(CONFIG_MTK_FW_ENCRYPT_VIA_OPTEE) += mtk_optee_aes_decrypt.o
+

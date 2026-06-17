@@ -83,6 +83,10 @@ void main_loop(void)
 	run_command("glbtn", 0);
 #endif
 
+#ifdef CONFIG_CMD_WPS_SLOT_SWITCH
+	run_command("wpsslot", 0);
+#endif
+
 	s = bootdelay_process();
 	if (cli_process_fdt(&s))
 		cli_secure_boot_cmd(s);
@@ -102,3 +106,4 @@ void main_loop(void)
 
 	panic("No CLI available");
 }
+

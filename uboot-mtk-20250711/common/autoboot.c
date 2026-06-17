@@ -473,10 +473,12 @@ const char *bootdelay_process(void)
 	debug("### main_loop entered: bootdelay=%d\n\n", bootdelay);
 
 	if (IS_ENABLED(CONFIG_AUTOBOOT_MENU_SHOW)) {
-		if (IS_ENABLED(CONFIG_AUTOBOOT_MENU_MTK_SHOW))
+		if (IS_ENABLED(CONFIG_AUTOBOOT_MENU_MTK_SHOW)) {
 			run_command("mtkautoboot", 0);
-		else
+			bootdelay = -1;
+		} else {
 			bootdelay = menu_show(bootdelay);
+		}	
 	}
 	bootretry_init_cmd_timeout();
 
@@ -524,3 +526,4 @@ void autoboot_command(const char *s)
 			run_command_list(s, -1, 0);
 	}
 }
+

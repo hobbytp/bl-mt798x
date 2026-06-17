@@ -422,10 +422,14 @@ static struct bootmenu_data *bootmenu_create(int uefi, int delay)
 			goto cleanup;
 
 		/* Add Quit entry if exiting bootmenu is disabled */
-		if (!IS_ENABLED(CONFIG_BOOTMENU_DISABLE_UBOOT_CONSOLE))
-			entry->title = strdup("0. Exit");
-		else
+		if (!IS_ENABLED(CONFIG_BOOTMENU_DISABLE_UBOOT_CONSOLE)) {
+			if (IS_ENABLED(CONFIG_AUTOBOOT_MENU_MTK_SHOW))
+				entry->title = strdup("0. U-Boot console");
+			else
+				entry->title = strdup("0. Exit");
+		} else {
 			entry->title = strdup("0. Quit");
+		}
 
 		if (!entry->title) {
 			free(entry);
@@ -715,3 +719,4 @@ U_BOOT_CMD(
 	"-e    - show UEFI entries\n"
 	"delay - show ANSI terminal bootmenu with autoboot delay"
 );
+

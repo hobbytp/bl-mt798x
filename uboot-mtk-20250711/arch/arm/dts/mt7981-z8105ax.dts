@@ -30,6 +30,13 @@
 			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
 			debounce-interval = <60>;
 		};
+
+		mesh {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&pio 0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
 	};
 
 	leds {

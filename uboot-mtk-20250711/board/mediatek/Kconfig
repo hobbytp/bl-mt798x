@@ -347,6 +347,15 @@ config MTK_DUAL_BOOT_ENABLE_RETRY
 	  Once U-Boot found that boot-count is larger than max retry count, the
 	  current slot will be marked invalid.
 
+config CMD_WPS_SLOT_SWITCH
+	bool "Enable WPS/Mesh button A/B slot switch command"
+	depends on BUTTON
+	default n
+	help
+	  Enable the wpsslot command. When the WPS/Mesh button is held during
+	  U-Boot startup, the command clears the next A/B slot invalid flag,
+	  resets its bootcount when possible, and switches current_slot to it.
+
 config MTK_DUAL_BOOT_MAX_RETRY_COUNT
 	int "Max boot retry count"
 	range 2 127
@@ -650,3 +659,4 @@ source "board/mediatek/common/customizations/Kconfig"
 endmenu
 
 endif # ARCH_MEDIATEK
+
