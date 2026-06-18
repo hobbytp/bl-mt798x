@@ -9,6 +9,7 @@
 #include <dm.h>
 #include <abuf.h>
 #include <env.h>
+#include <enetlite_bootinfo.h>
 #include <log.h>
 #include <mapmem.h>
 #include <net.h>
@@ -399,6 +400,10 @@ int fdt_chosen(void *fdt)
 		       fdt_strerror(err));
 		return err;
 	}
+
+	err = enetlite_bootinfo_fdt_fixup(fdt, nodeoffset);
+	if (err < 0)
+		return err;
 
 	return fdt_fixup_stdout(fdt, nodeoffset);
 }
@@ -2272,3 +2277,4 @@ int fdt_fixup_pmem_region(void *fdt, u64 pmem_start, u64 pmem_size)
 
 	return 0;
 }
+

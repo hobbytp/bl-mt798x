@@ -56,6 +56,19 @@ build_generic_fiptool() {
 	make -C "$ATF_DIR/tools/fiptool" all
 }
 
+enetlite_build_id() {
+	short_sha=$(git rev-parse --short=12 HEAD 2>/dev/null || true)
+	[ -z "$short_sha" ] && short_sha="unknown"
+
+	build_id="g$short_sha"
+
+	if git status --porcelain --untracked-files=no -- "$UBOOT_DIR" "$ATF_DIR" build.sh 2>/dev/null | grep -q .; then
+		build_id="${build_id}-dirty"
+	fi
+
+	printf '%s\n' "$build_id"
+}
+
 if [ -z "$SOC" ] || [ -z "$BOARD" ]; then
 	echo "Usage: SOC=[mt7981|mt7986] BOARD=<board name> MULTI_LAYOUT=[0|1] $0"
 	echo "Defaults: UBOOT_DIR=$DEFAULT_UBOOT_DIR ATF_DIR=$DEFAULT_ATF_DIR"
@@ -124,6 +137,12 @@ echo "atf config root: $ATF_CONFIG_ROOT"
 echo "u-boot config: $UBOOT_CFG"
 echo "atf config: $ATF_CFG"
 
+ENETLITE_BUILD_ID=
+if grep -q '^CONFIG_ENETLITE_BOOTINFO=y' "$UBOOT_CONFIG_ROOT/$UBOOT_CFG"; then
+	ENETLITE_BUILD_ID=$(enetlite_build_id)
+	echo "eNetLiteBoot build id: $ENETLITE_BUILD_ID"
+fi
+
 echo "Build u-boot..."
 rm -f "$UBOOT_DIR/u-boot.bin"
 cp -f "$UBOOT_CONFIG_ROOT/$UBOOT_CFG" "$UBOOT_DIR/.config"
@@ -131,6 +150,9 @@ if [ "$fixedparts" = "1" ]; then
 	echo "Build u-boot with fixed-mtdparts!"
 	echo "CONFIG_MEDIATEK_UBI_FIXED_MTDPARTS=y" >> "$UBOOT_DIR/.config"
 	echo "CONFIG_MTK_FIXED_MTD_MTDPARTS=y" >> "$UBOOT_DIR/.config"
+fi
+if [ -n "$ENETLITE_BUILD_ID" ]; then
+	echo "CONFIG_ENETLITE_BOOTLOADER_BUILD_ID=\"$ENETLITE_BUILD_ID\"" >> "$UBOOT_DIR/.config"
 fi
 make -C "$UBOOT_DIR" olddefconfig
 make -C "$UBOOT_DIR" clean
@@ -189,6 +211,7 @@ ATF_DIR=$ATF_DIR
 ATF_CFG=$ATF_CFG
 UBOOT_DIR=$UBOOT_DIR
 UBOOT_CFG=$UBOOT_CFG
+ENETLITE_BUILD_ID=${ENETLITE_BUILD_ID:-}
 
 Before flashing:
 - Verify the image size fits in the target FIP partition.
@@ -240,6 +263,7 @@ Recommended use: upgrade FIP once from the older U-Boot boot menu that rejects
 the MediaTek checksum ToC entry.
 
 It still contains BL31 and BL33/U-Boot, and it keeps the existing BL2 unchanged.
+ENETLITE_BUILD_ID=${ENETLITE_BUILD_ID:-}
 Z8105AX U-Boot keeps CONFIG_MTK_UPGRADE_FIP_VERIFY enabled and uses a stable
 compatible prefix accepted by the older boot menu:
 

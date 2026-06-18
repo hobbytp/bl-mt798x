@@ -35,6 +35,7 @@
 
 #define PART_FIT_NAME		"fit"
 #define PART_UBI_NAME		"ubi"
+#define PART_SHARED_DATA_NAME	"shared_data"
 
 #define UBI_MOUNT_RECREATE	(!IS_ENABLED(CONFIG_MTK_DUAL_BOOT) && \
 				 !IS_ENABLED(CONFIG_MTK_BOOTMENU_UBI))
@@ -56,7 +57,8 @@ static char ubi_root_path[BOOT_PARAM_STR_MAX_LEN];
 #ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
 #define DUAL_BOOT_ROOTFS_DATA_SIZE_MIN_MIB	64
 #define DUAL_BOOT_ROOTFS_DATA_SIZE_MAX_MIB	256
-#define DUAL_BOOT_ROOTFS_DATA_OVERSIZED_MIB	300
+#define DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB	64
+#define SHARED_DATA_SIZE_MIB		88
 
 static char rootfs_data_size_limit[BOOT_PARAM_STR_MAX_LEN];
 
@@ -90,9 +92,13 @@ static u64 dual_boot_rootfs_data_size_bytes(void)
 	return (u64)dual_boot_rootfs_data_size_mib() << 20;
 }
 
-static u64 dual_boot_rootfs_data_oversized_bytes(void)
+static int dual_boot_seed_rootfs_data_size_env(void)
 {
-	return (u64)DUAL_BOOT_ROOTFS_DATA_OVERSIZED_MIB << 20;
+	if (env_get(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV))
+		return 0;
+
+	return env_set_ulong(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV,
+			     CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE);
 }
 #endif
 
@@ -745,6 +751,160 @@ static int ubi_target_pebs(u64 size)
 	return div_u64(size + ubi->leb_size - 1, ubi->leb_size);
 }
 
+static u64 ubi_pebs_to_bytes(int pebs)
+{
+	struct ubi_device *ubi = ubi_devices[0];
+
+	if (!ubi || pebs <= 0)
+		return 0;
+
+	return (u64)pebs * ubi->leb_size;
+}
+
+static u64 dual_boot_firmware_size_max_bytes(void)
+{
+	return (u64)DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB << 20;
+}
+
+static int shared_data_target_pebs(void)
+{
+	return ubi_target_pebs((u64)SHARED_DATA_SIZE_MIB << 20);
+}
+
+static int shared_data_reclaim_if_needed(int required_pebs,
+					 int reclaimable_pebs,
+					 const char *reason)
+{
+	struct ubi_device *ubi = ubi_devices[0];
+	struct ubi_volume *vol;
+	int ret;
+
+	if (!ubi)
+		return -ENODEV;
+
+	if (ubi->avail_pebs + reclaimable_pebs >= required_pebs)
+		return 0;
+
+	vol = ubi_find_volume((char *)PART_SHARED_DATA_NAME);
+	if (!vol)
+		return 0;
+
+	printf("Warning: removing %s (%d PEBs) to make room for %s\n",
+	       PART_SHARED_DATA_NAME, vol->reserved_pebs, reason);
+
+	ret = remove_ubi_volume(PART_SHARED_DATA_NAME);
+	if (ret)
+		cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+			 PART_SHARED_DATA_NAME, ret);
+
+	return ret;
+}
+
+static int shared_data_ensure_firmware_space(const char *firmware_part,
+					     const char *rootfs_data_part,
+					     size_t firmware_size)
+{
+	struct ubi_volume *vol;
+	int required_pebs, reclaimable_pebs = 0;
+
+	if (firmware_size > dual_boot_firmware_size_max_bytes()) {
+		cprintln(ERROR,
+			 "*** Firmware image is %llu bytes, exceeds A/B layout limit %llu bytes (%u MiB) ***",
+			 (unsigned long long)firmware_size,
+			 (unsigned long long)dual_boot_firmware_size_max_bytes(),
+			 DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB);
+		return -ENOSPC;
+	}
+
+	required_pebs = ubi_target_pebs(firmware_size);
+	if (required_pebs < 0)
+		return required_pebs;
+
+	vol = ubi_find_volume((char *)firmware_part);
+	if (vol)
+		reclaimable_pebs = vol->reserved_pebs;
+
+	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA) &&
+	    ubi_devices[0] &&
+	    ubi_devices[0]->avail_pebs + reclaimable_pebs < required_pebs) {
+		vol = ubi_find_volume((char *)rootfs_data_part);
+		if (vol) {
+			int data_pebs = vol->reserved_pebs;
+			int ret;
+
+			printf("Warning: removing target %s (%d PEBs) to make room for firmware upgrade\n",
+			       rootfs_data_part, data_pebs);
+			ret = remove_ubi_volume(rootfs_data_part);
+			if (ret)
+				return ret;
+		}
+	}
+
+	return shared_data_reclaim_if_needed(required_pebs, reclaimable_pebs,
+					     "firmware upgrade");
+}
+
+static int shared_data_ensure_volume(void)
+{
+	struct ubi_device *ubi = ubi_devices[0];
+	struct ubi_volume *vol;
+	int target_pebs, ret;
+	u64 create_size;
+
+	if (!ubi)
+		return -ENODEV;
+
+	vol = ubi_find_volume((char *)PART_SHARED_DATA_NAME);
+	if (vol) {
+		target_pebs = shared_data_target_pebs();
+		if (target_pebs < 0)
+			return target_pebs;
+
+		printf("A/B shared_data: %s capacity %llu bytes (%d PEBs), target %u MiB (%d PEBs)\n",
+		       PART_SHARED_DATA_NAME,
+		       (unsigned long long)vol->reserved_pebs *
+		       vol->usable_leb_size,
+		       vol->reserved_pebs, SHARED_DATA_SIZE_MIB,
+		       target_pebs);
+
+		if (vol->reserved_pebs == target_pebs)
+			return 0;
+
+		printf("Warning: removing %s to normalize fixed shared_data size\n",
+		       PART_SHARED_DATA_NAME);
+		ret = remove_ubi_volume(PART_SHARED_DATA_NAME);
+		if (ret) {
+			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+				 PART_SHARED_DATA_NAME, ret);
+			return ret;
+		}
+	}
+
+	target_pebs = shared_data_target_pebs();
+	if (target_pebs < 0)
+		return target_pebs;
+
+	if (ubi->avail_pebs < target_pebs) {
+		printf("Warning: skip %s creation, available=%d PEBs, target=%d PEBs (%u MiB)\n",
+		       PART_SHARED_DATA_NAME, ubi->avail_pebs, target_pebs,
+		       SHARED_DATA_SIZE_MIB);
+		return 0;
+	}
+
+	create_size = ubi_pebs_to_bytes(target_pebs);
+
+	printf("Creating shared volume %s of size %llu (%d PEBs, %u MiB fixed target)\n",
+	       PART_SHARED_DATA_NAME, (unsigned long long)create_size,
+	       target_pebs, SHARED_DATA_SIZE_MIB);
+
+	ret = create_ubi_volume(PART_SHARED_DATA_NAME, create_size, -1, false);
+	if (ret)
+		printf("Warning: failed to create %s, err = %d\n",
+		       PART_SHARED_DATA_NAME, ret);
+
+	return 0;
+}
+
 static void rootfs_data_read_state(const char *name,
 				   struct rootfs_data_volume_state *state)
 {
@@ -785,15 +945,21 @@ static void rootfs_data_print_state(const struct rootfs_data_volume_state *state
 static const char *rootfs_data_state_problem(
 	const struct rootfs_data_volume_state *state, u64 target_size)
 {
+	int target_pebs;
+
 	if (!state->exists)
 		return "missing";
 
+	target_pebs = ubi_target_pebs(target_size);
+	if (target_pebs < 0)
+		return "invalid target size";
+
 	/* Missing volumes have no meaningful size; report that first. */
-	if (state->capacity_bytes < target_size)
+	if (state->reserved_pebs < target_pebs)
 		return "below target size";
 
-	if (state->capacity_bytes > dual_boot_rootfs_data_oversized_bytes())
-		return "oversized old layout";
+	if (state->reserved_pebs > target_pebs)
+		return "above target size";
 
 	return NULL;
 }
@@ -849,12 +1015,23 @@ static int rootfs_data_normalize_single(const char *name, u64 target_size,
 					const char *reason)
 {
 	struct rootfs_data_volume_state state;
-	int ret;
+	int ret, target_pebs, reclaimable_pebs = 0;
 
 	rootfs_data_read_state(name, &state);
 	rootfs_data_print_state(&state);
 
 	printf("Warning: normalizing shared rootfs_data layout: %s\n", reason);
+
+	target_pebs = ubi_target_pebs(target_size);
+	if (target_pebs < 0)
+		return target_pebs;
+	if (state.exists)
+		reclaimable_pebs = state.reserved_pebs;
+
+	ret = shared_data_reclaim_if_needed(target_pebs, reclaimable_pebs,
+					    "shared rootfs_data normalization");
+	if (ret)
+		return ret;
 
 	ret = rootfs_data_check_normalize_budget(&state, NULL, target_size, 1);
 	if (ret)
@@ -882,7 +1059,7 @@ static int rootfs_data_normalize_pair(const char *reason, const char *volume,
 	struct rootfs_data_volume_state rootfs_data, rootfs_data2;
 	const char *slot0_rootfs_data = dual_boot_slots[0].rootfs_data;
 	const char *slot1_rootfs_data = dual_boot_slots[1].rootfs_data;
-	int ret;
+	int ret, target_pebs, reclaimable_pebs = 0;
 
 	if (!slot0_rootfs_data || !slot1_rootfs_data) {
 		cprintln(ERROR, "*** A/B rootfs_data volume names are not configured ***");
@@ -898,6 +1075,19 @@ static int rootfs_data_normalize_pair(const char *reason, const char *volume,
 	       volume ? volume : "", volume ? ": " : "", reason);
 	printf("Warning: removing old rootfs_data overlay volumes and recreating both at %llu bytes\n",
 	       (unsigned long long)target_size);
+
+	target_pebs = ubi_target_pebs(target_size);
+	if (target_pebs < 0)
+		return target_pebs;
+	if (rootfs_data.exists)
+		reclaimable_pebs += rootfs_data.reserved_pebs;
+	if (rootfs_data2.exists)
+		reclaimable_pebs += rootfs_data2.reserved_pebs;
+
+	ret = shared_data_reclaim_if_needed(target_pebs * 2, reclaimable_pebs,
+					    "A/B rootfs_data normalization");
+	if (ret)
+		return ret;
 
 	ret = rootfs_data_check_normalize_budget(&rootfs_data, &rootfs_data2,
 						 target_size, 2);
@@ -954,10 +1144,9 @@ static int mtd_dual_boot_ensure_rootfs_data(u32 slot, const char *rootfs_data,
 	printf("A/B rootfs_data: preparing layout for slot %u (target volume: %s, recreate=%s)\n",
 	       slot, rootfs_data ? rootfs_data : "<null>",
 	       recreate_target ? "yes" : "no");
-	printf("A/B rootfs_data target size: %llu bytes (%u MiB), oversized threshold: %u MiB\n",
+	printf("A/B rootfs_data target size: %llu bytes (%u MiB)\n",
 	       (unsigned long long)target_size,
-	       dual_boot_rootfs_data_size_mib(),
-	       DUAL_BOOT_ROOTFS_DATA_OVERSIZED_MIB);
+	       dual_boot_rootfs_data_size_mib());
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA)) {
 		rootfs_data_read_state(rootfs_data, &target_state);
@@ -982,28 +1171,49 @@ static int mtd_dual_boot_ensure_rootfs_data(u32 slot, const char *rootfs_data,
 	rootfs_data_print_state(&slot1_state);
 
 	problem = rootfs_data_state_problem(&slot0_state, target_size);
+	if (recreate_target && !slot0_state.exists &&
+	    !strcmp(rootfs_data, slot0_state.name))
+		problem = NULL;
 	if (problem)
 		return rootfs_data_normalize_pair(problem, slot0_state.name,
 						  target_size);
 
 	problem = rootfs_data_state_problem(&slot1_state, target_size);
+	if (recreate_target && !slot1_state.exists &&
+	    !strcmp(rootfs_data, slot1_state.name))
+		problem = NULL;
 	if (problem)
 		return rootfs_data_normalize_pair(problem, slot1_state.name,
 						  target_size);
 
 	if (recreate_target && !IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
+		int target_pebs;
+
 		rootfs_data_read_state(rootfs_data, &target_state);
+
+		target_pebs = ubi_target_pebs(target_size);
+		if (target_pebs < 0)
+			return target_pebs;
+
+		ret = shared_data_reclaim_if_needed(
+			target_pebs,
+			target_state.exists ? target_state.reserved_pebs : 0,
+			"target rootfs_data refresh");
+		if (ret)
+			return ret;
 
 		ret = rootfs_data_check_normalize_budget(&target_state, NULL,
 							 target_size, 1);
 		if (ret)
 			return ret;
 
-		ret = remove_ubi_volume(rootfs_data);
-		if (ret) {
-			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
-				 rootfs_data, ret);
-			return ret;
+		if (target_state.exists) {
+			ret = remove_ubi_volume(rootfs_data);
+			if (ret) {
+				cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
+					 rootfs_data, ret);
+				return ret;
+			}
 		}
 
 		ret = rootfs_data_create_fixed(rootfs_data, target_size);
@@ -1205,6 +1415,16 @@ static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 			 "*** A/B rootfs_data layout preparation failed, not switching slot ***");
 		return ret;
 	}
+
+	ret = shared_data_ensure_volume();
+	if (ret)
+		printf("Warning: failed to ensure %s, error %d\n",
+		       PART_SHARED_DATA_NAME, ret);
+
+	ret = dual_boot_seed_rootfs_data_size_env();
+	if (ret)
+		printf("Warning: failed to seed %s in env, error %d\n",
+		       DUAL_BOOT_ROOTFS_DATA_SIZE_ENV, ret);
 #else
 	ret = dual_boot_set_slot_invalid(slot, false, false);
 	if (ret)
@@ -1367,6 +1587,11 @@ static int write_ubi_itb_image(const void *data, size_t size,
 						       false);
 		if (ret)
 			return ret;
+
+		ret = shared_data_ensure_firmware_space(firmware_part,
+							rootfs_data_part, size);
+		if (ret)
+			return ret;
 	}
 #endif
 
@@ -1496,6 +1721,11 @@ static int ubi_set_fdtargs_dual_boot(void)
 
 	ret = fdtargs_set("mediatek,rootfs_data-size-limit",
 			  rootfs_data_size_limit);
+	if (ret)
+		return ret;
+
+	ret = fdtargs_set("mediatek,shared-data-volume",
+			  PART_SHARED_DATA_NAME);
 	if (ret)
 		return ret;
 #endif

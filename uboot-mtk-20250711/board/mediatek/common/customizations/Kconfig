@@ -15,4 +15,26 @@ config MTK_COLOR_LED
 
 endif #MTK_MISC_CUSTOMIZED
 
+config ENETLITE_BOOTINFO
+	bool "Enable eNetLiteBoot branding and version metadata"
+	default n
+	help
+	  Enable eNetLiteBoot branding, build metadata, Web failsafe version
+	  output and OpenWrt-readable FDT /chosen properties.
+
+config ENETLITE_BOOTLOADER_NAME
+	string "eNetLiteBoot display name"
+	depends on ENETLITE_BOOTINFO
+	default "eNetLiteBoot"
+
+config ENETLITE_BOOTLOADER_VERSION
+	string "eNetLiteBoot release version"
+	depends on ENETLITE_BOOTINFO
+	default "eNetLiteBoot v26.06R0"
+
+config ENETLITE_BOOTLOADER_BUILD_ID
+	string "eNetLiteBoot build id"
+	depends on ENETLITE_BOOTINFO
+	default "unknown"
+
 

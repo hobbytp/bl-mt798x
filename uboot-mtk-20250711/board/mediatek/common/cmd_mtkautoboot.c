@@ -9,6 +9,7 @@
 
 #include <command.h>
 #include <env.h>
+#include <enetlite_bootinfo.h>
 #include <menu.h>
 #include <stdio.h>
 #include <time.h>
@@ -105,6 +106,7 @@ static int do_mtkautoboot(struct cmd_tbl *cmdtp, int flag, int argc,
 #endif
 
 	in_menu = true;
+	enetlite_bootinfo_print();
 
 	do {
 		repeat_menu = false;

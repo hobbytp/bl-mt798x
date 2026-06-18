@@ -42,6 +42,8 @@ obj-$(CONFIG_MTK_WGET) += mtk_wget.o cmd_wget.o
 
 obj-$(CONFIG_CMD_WPS_SLOT_SWITCH) += cmd_wpsslot.o
 
+obj-$(CONFIG_ENETLITE_BOOTINFO) += enetlite_bootinfo.o
+
 endif
 
 obj-$(CONFIG_MTK_ANTI_ROLLBACK) += mtk_ar.o mtk_efuse.o

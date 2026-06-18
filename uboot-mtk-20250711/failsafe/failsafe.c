@@ -8,6 +8,7 @@
  */
 
 #include <command.h>
+#include <enetlite_bootinfo.h>
 #include <errno.h>
 #include <env.h>
 #include <malloc.h>
@@ -81,12 +82,14 @@ static void version_handler(enum httpd_uri_handler_status status,
 
 	response->status = HTTP_RESP_STD;
 
-	response->data = version_string;
+	response->data = enetlite_bootinfo_web_version();
+	if (!response->data)
+	    response->data = version_string;
 	response->size = strlen(response->data);
 
 	response->info.code = 200;
 	response->info.connection_close = 1;
-	response->info.content_type = "text/plain";
+	response->info.content_type = "text/html";
 }
 
 static void index_handler(enum httpd_uri_handler_status status,
@@ -447,3 +450,4 @@ static int do_httpd(struct cmd_tbl *cmdtp, int flag, int argc,
 U_BOOT_CMD(httpd, 1, 0, do_httpd,
 	"Start failsafe HTTP server", ""
 );
+
