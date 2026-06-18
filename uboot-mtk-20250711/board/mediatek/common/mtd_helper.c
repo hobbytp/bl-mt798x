@@ -57,10 +57,13 @@ static char ubi_root_path[BOOT_PARAM_STR_MAX_LEN];
 #ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
 #define DUAL_BOOT_ROOTFS_DATA_SIZE_MIN_MIB	64
 #define DUAL_BOOT_ROOTFS_DATA_SIZE_MAX_MIB	256
+#define DUAL_BOOT_SHARED_DATA_SIZE_MIN_MIB	32
+#define DUAL_BOOT_SHARED_DATA_SIZE_MAX_MIB	128
 #define DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB	64
 #define SHARED_DATA_SIZE_MIB		88
 
 static char rootfs_data_size_limit[BOOT_PARAM_STR_MAX_LEN];
+static char shared_data_size_limit[BOOT_PARAM_STR_MAX_LEN];
 
 struct rootfs_data_volume_state {
 	const char *name;
@@ -92,6 +95,29 @@ static u64 dual_boot_rootfs_data_size_bytes(void)
 	return (u64)dual_boot_rootfs_data_size_mib() << 20;
 }
 
+static u32 dual_boot_shared_data_size_mib(void)
+{
+	const char *value = env_get(DUAL_BOOT_SHARED_DATA_SIZE_ENV);
+	unsigned long mib;
+
+	if (value && !strict_strtoul(value, 10, &mib) &&
+	    mib >= DUAL_BOOT_SHARED_DATA_SIZE_MIN_MIB &&
+	    mib <= DUAL_BOOT_SHARED_DATA_SIZE_MAX_MIB)
+		return mib;
+
+	if (value)
+		printf("Warning: invalid %s=%s, using default %d\n",
+		       DUAL_BOOT_SHARED_DATA_SIZE_ENV, value,
+		       SHARED_DATA_SIZE_MIB);
+
+	return SHARED_DATA_SIZE_MIB;
+}
+
+static u64 dual_boot_shared_data_size_bytes(void)
+{
+	return (u64)dual_boot_shared_data_size_mib() << 20;
+}
+
 static int dual_boot_seed_rootfs_data_size_env(void)
 {
 	if (env_get(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV))
@@ -99,6 +125,15 @@ static int dual_boot_seed_rootfs_data_size_env(void)
 
 	return env_set_ulong(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV,
 			     CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE);
+}
+
+static int dual_boot_seed_shared_data_size_env(void)
+{
+	if (env_get(DUAL_BOOT_SHARED_DATA_SIZE_ENV))
+		return 0;
+
+	return env_set_ulong(DUAL_BOOT_SHARED_DATA_SIZE_ENV,
+			     SHARED_DATA_SIZE_MIB);
 }
 #endif
 
@@ -768,7 +803,7 @@ static u64 dual_boot_firmware_size_max_bytes(void)
 
 static int shared_data_target_pebs(void)
 {
-	return ubi_target_pebs((u64)SHARED_DATA_SIZE_MIB << 20);
+	return ubi_target_pebs(dual_boot_shared_data_size_bytes());
 }
 
 static int shared_data_reclaim_if_needed(int required_pebs,
@@ -849,10 +884,13 @@ static int shared_data_ensure_volume(void)
 	struct ubi_device *ubi = ubi_devices[0];
 	struct ubi_volume *vol;
 	int target_pebs, ret;
+	u32 target_mib;
 	u64 create_size;
 
 	if (!ubi)
 		return -ENODEV;
+
+	target_mib = dual_boot_shared_data_size_mib();
 
 	vol = ubi_find_volume((char *)PART_SHARED_DATA_NAME);
 	if (vol) {
@@ -864,7 +902,7 @@ static int shared_data_ensure_volume(void)
 		       PART_SHARED_DATA_NAME,
 		       (unsigned long long)vol->reserved_pebs *
 		       vol->usable_leb_size,
-		       vol->reserved_pebs, SHARED_DATA_SIZE_MIB,
+		       vol->reserved_pebs, target_mib,
 		       target_pebs);
 
 		if (vol->reserved_pebs == target_pebs)
@@ -887,7 +925,7 @@ static int shared_data_ensure_volume(void)
 	if (ubi->avail_pebs < target_pebs) {
 		printf("Warning: skip %s creation, available=%d PEBs, target=%d PEBs (%u MiB)\n",
 		       PART_SHARED_DATA_NAME, ubi->avail_pebs, target_pebs,
-		       SHARED_DATA_SIZE_MIB);
+		       target_mib);
 		return 0;
 	}
 
@@ -895,7 +933,7 @@ static int shared_data_ensure_volume(void)
 
 	printf("Creating shared volume %s of size %llu (%d PEBs, %u MiB fixed target)\n",
 	       PART_SHARED_DATA_NAME, (unsigned long long)create_size,
-	       target_pebs, SHARED_DATA_SIZE_MIB);
+	       target_pebs, target_mib);
 
 	ret = create_ubi_volume(PART_SHARED_DATA_NAME, create_size, -1, false);
 	if (ret)
@@ -1425,6 +1463,11 @@ static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 	if (ret)
 		printf("Warning: failed to seed %s in env, error %d\n",
 		       DUAL_BOOT_ROOTFS_DATA_SIZE_ENV, ret);
+
+	ret = dual_boot_seed_shared_data_size_env();
+	if (ret)
+		printf("Warning: failed to seed %s in env, error %d\n",
+		       DUAL_BOOT_SHARED_DATA_SIZE_ENV, ret);
 #else
 	ret = dual_boot_set_slot_invalid(slot, false, false);
 	if (ret)
@@ -1726,6 +1769,15 @@ static int ubi_set_fdtargs_dual_boot(void)
 
 	ret = fdtargs_set("mediatek,shared-data-volume",
 			  PART_SHARED_DATA_NAME);
+	if (ret)
+		return ret;
+
+	snprintf(shared_data_size_limit, sizeof(shared_data_size_limit),
+		 "%llu",
+		 (unsigned long long)dual_boot_shared_data_size_bytes());
+
+	ret = fdtargs_set("mediatek,shared-data-size-limit",
+			  shared_data_size_limit);
 	if (ret)
 		return ret;
 #endif

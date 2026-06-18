@@ -21,6 +21,9 @@
 #ifndef DUAL_BOOT_ROOTFS_DATA_SIZE_ENV
 #define DUAL_BOOT_ROOTFS_DATA_SIZE_ENV	"dual_boot.rootfs_data_size_mib"
 #endif
+#ifndef DUAL_BOOT_SHARED_DATA_SIZE_ENV
+#define DUAL_BOOT_SHARED_DATA_SIZE_ENV	"dual_boot.shared_data_size_mib"
+#endif
 
 void dual_boot_disable(void);
 u32 dual_boot_get_current_slot(void);
