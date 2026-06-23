@@ -79,12 +79,12 @@ void main_loop(void)
 	}
 #endif /* CONFIG_MTK_HTTPD */
 
-#ifdef CONFIG_CMD_GL_BTN
-	run_command("glbtn", 0);
-#endif
-
 #ifdef CONFIG_CMD_WPS_SLOT_SWITCH
 	run_command("wpsslot", 0);
+#endif
+
+#ifdef CONFIG_CMD_GL_BTN
+	run_command("glbtn", 0);
 #endif
 
 	s = bootdelay_process();
@@ -106,4 +106,3 @@ void main_loop(void)
 
 	panic("No CLI available");
 }
-

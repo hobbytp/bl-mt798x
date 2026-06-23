@@ -352,9 +352,11 @@ config CMD_WPS_SLOT_SWITCH
 	depends on BUTTON
 	default n
 	help
-	  Enable the wpsslot command. When the WPS/Mesh button is held during
-	  U-Boot startup, the command clears the next A/B slot invalid flag,
-	  resets its bootcount when possible, and switches current_slot to it.
+	  Enable the wpsslot command. When the reset and WPS/Mesh buttons are
+	  held together during U-Boot startup, the command clears the next A/B
+	  slot invalid flag, resets its bootcount when possible, and switches
+	  current_slot to it. Holding only the WPS/Mesh button does not switch
+	  slots.
 
 config MTK_DUAL_BOOT_MAX_RETRY_COUNT
 	int "Max boot retry count"
@@ -659,4 +661,3 @@ source "board/mediatek/common/customizations/Kconfig"
 endmenu
 
 endif # ARCH_MEDIATEK
-
