@@ -905,17 +905,12 @@ static int shared_data_ensure_volume(void)
 		       vol->reserved_pebs, target_mib,
 		       target_pebs);
 
-		if (vol->reserved_pebs == target_pebs)
+		if (vol->reserved_pebs >= target_pebs)
 			return 0;
 
-		printf("Warning: removing %s to normalize fixed shared_data size\n",
+		printf("Warning: keeping existing %s below target size; not deleting user data automatically\n",
 		       PART_SHARED_DATA_NAME);
-		ret = remove_ubi_volume(PART_SHARED_DATA_NAME);
-		if (ret) {
-			cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
-				 PART_SHARED_DATA_NAME, ret);
-			return ret;
-		}
+		return 0;
 	}
 
 	target_pebs = shared_data_target_pebs();
