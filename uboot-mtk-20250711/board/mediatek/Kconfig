@@ -441,6 +441,16 @@ config MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA
 	  This option is valid only if rootfs_data is shared. For UBI, the
 	  shared rootfs_data must also have limited size.
 
+config MTK_DUAL_BOOT_ALLOW_SHARED_DATA_RECLAIM
+	bool "Allow deleting shared_data to make room during U-Boot upgrades"
+	default n
+	depends on MTK_DUAL_BOOT && MTD_UBI
+	help
+	  Enable this only for recovery or factory builds where completing a
+	  U-Boot-side firmware upgrade is more important than preserving data
+	  in the shared_data UBI volume. When disabled, U-Boot will fail the
+	  upgrade with ENOSPC instead of deleting shared_data.
+
 config MTK_DUAL_BOOT_EMERG_IMAGE
 	bool "Enable booting emergency image if both slots failed"
 	depends on MTK_BOOTMENU_MMC

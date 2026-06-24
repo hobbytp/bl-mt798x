@@ -786,24 +786,9 @@ static int ubi_target_pebs(u64 size)
 	return div_u64(size + ubi->leb_size - 1, ubi->leb_size);
 }
 
-static u64 ubi_pebs_to_bytes(int pebs)
-{
-	struct ubi_device *ubi = ubi_devices[0];
-
-	if (!ubi || pebs <= 0)
-		return 0;
-
-	return (u64)pebs * ubi->leb_size;
-}
-
 static u64 dual_boot_firmware_size_max_bytes(void)
 {
 	return (u64)DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB << 20;
-}
-
-static int shared_data_target_pebs(void)
-{
-	return ubi_target_pebs(dual_boot_shared_data_size_bytes());
 }
 
 static int shared_data_reclaim_if_needed(int required_pebs,
@@ -821,8 +806,19 @@ static int shared_data_reclaim_if_needed(int required_pebs,
 		return 0;
 
 	vol = ubi_find_volume((char *)PART_SHARED_DATA_NAME);
-	if (!vol)
-		return 0;
+	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ALLOW_SHARED_DATA_RECLAIM)) {
+		printf("Error: not enough UBI space for %s: required=%d PEBs, available=%d PEBs, reclaimable=%d PEBs; preserving %s\n",
+		       reason, required_pebs, ubi->avail_pebs,
+		       reclaimable_pebs, PART_SHARED_DATA_NAME);
+		return -ENOSPC;
+	}
+
+	if (!vol) {
+		printf("Error: not enough UBI space for %s: required=%d PEBs, available=%d PEBs, reclaimable=%d PEBs; %s is not present\n",
+		       reason, required_pebs, ubi->avail_pebs,
+		       reclaimable_pebs, PART_SHARED_DATA_NAME);
+		return -ENOSPC;
+	}
 
 	printf("Warning: removing %s (%d PEBs) to make room for %s\n",
 	       PART_SHARED_DATA_NAME, vol->reserved_pebs, reason);
@@ -877,65 +873,6 @@ static int shared_data_ensure_firmware_space(const char *firmware_part,
 
 	return shared_data_reclaim_if_needed(required_pebs, reclaimable_pebs,
 					     "firmware upgrade");
-}
-
-static int shared_data_ensure_volume(void)
-{
-	struct ubi_device *ubi = ubi_devices[0];
-	struct ubi_volume *vol;
-	int target_pebs, ret;
-	u32 target_mib;
-	u64 create_size;
-
-	if (!ubi)
-		return -ENODEV;
-
-	target_mib = dual_boot_shared_data_size_mib();
-
-	vol = ubi_find_volume((char *)PART_SHARED_DATA_NAME);
-	if (vol) {
-		target_pebs = shared_data_target_pebs();
-		if (target_pebs < 0)
-			return target_pebs;
-
-		printf("A/B shared_data: %s capacity %llu bytes (%d PEBs), target %u MiB (%d PEBs)\n",
-		       PART_SHARED_DATA_NAME,
-		       (unsigned long long)vol->reserved_pebs *
-		       vol->usable_leb_size,
-		       vol->reserved_pebs, target_mib,
-		       target_pebs);
-
-		if (vol->reserved_pebs >= target_pebs)
-			return 0;
-
-		printf("Warning: keeping existing %s below target size; not deleting user data automatically\n",
-		       PART_SHARED_DATA_NAME);
-		return 0;
-	}
-
-	target_pebs = shared_data_target_pebs();
-	if (target_pebs < 0)
-		return target_pebs;
-
-	if (ubi->avail_pebs < target_pebs) {
-		printf("Warning: skip %s creation, available=%d PEBs, target=%d PEBs (%u MiB)\n",
-		       PART_SHARED_DATA_NAME, ubi->avail_pebs, target_pebs,
-		       target_mib);
-		return 0;
-	}
-
-	create_size = ubi_pebs_to_bytes(target_pebs);
-
-	printf("Creating shared volume %s of size %llu (%d PEBs, %u MiB fixed target)\n",
-	       PART_SHARED_DATA_NAME, (unsigned long long)create_size,
-	       target_pebs, target_mib);
-
-	ret = create_ubi_volume(PART_SHARED_DATA_NAME, create_size, -1, false);
-	if (ret)
-		printf("Warning: failed to create %s, err = %d\n",
-		       PART_SHARED_DATA_NAME, ret);
-
-	return 0;
 }
 
 static void rootfs_data_read_state(const char *name,
@@ -1448,11 +1385,6 @@ static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 			 "*** A/B rootfs_data layout preparation failed, not switching slot ***");
 		return ret;
 	}
-
-	ret = shared_data_ensure_volume();
-	if (ret)
-		printf("Warning: failed to ensure %s, error %d\n",
-		       PART_SHARED_DATA_NAME, ret);
 
 	ret = dual_boot_seed_rootfs_data_size_env();
 	if (ret)
@@ -2352,4 +2284,3 @@ void mtd_boot_set_defaults(void *fdt)
 		rootdisk_set_rootfs_ubi_relax(fdt, ubi_image_vol);
 #endif
 }
-
