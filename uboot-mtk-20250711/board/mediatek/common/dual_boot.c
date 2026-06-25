@@ -1,29 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2022 MediaTek Inc. All Rights Reserved.
- *
- * Author: Weijie Gao <weijie.gao@mediatek.com>
- *
- * Generic A/B boot implementation
+ * Enetlite A/B boot state machine.
  */
 
 #include <env.h>
-#include <stdio.h>
-#include <linux/errno.h>
-#include <vsprintf.h>
-#include <malloc.h>
 #include <image.h>
-#ifdef CONFIG_ARCH_MEDIATEK
-#include <linux/arm-smccc.h>
-#endif
+#include <malloc.h>
+#include <stdio.h>
+#include <vsprintf.h>
+#include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
 
 #include "dual_boot.h"
 #include "boot_helper.h"
 #include "rootdisk.h"
 
-#define MTK_SIP_READ_NONRST_REG			0xC2000570
-#define MTK_SIP_WRITE_NONRST_REG		0xC2000571
-#define MTK_SIP_SMC_UNK				0xffffffff
+#define ENETLITE_AB_MAX_TRIES		CONFIG_ENETLITE_AB_MAX_TRIES
+
+#define AB_ENV_SCHEMA			"dual_boot.schema"
+#define AB_ENV_STATE			"dual_boot.state"
+#define AB_ENV_CONFIRMED_SLOT		"dual_boot.confirmed_slot"
+#define AB_ENV_GOOD_MASK		"dual_boot.good_mask"
+#define AB_ENV_TARGET_SLOT		"dual_boot.target_slot"
+#define AB_ENV_OPERATION		"dual_boot.operation"
+#define AB_ENV_TRIES_LEFT		"dual_boot.tries_left"
+
+static const char * const ab_env_keys[] = {
+	AB_ENV_SCHEMA,
+	AB_ENV_STATE,
+	AB_ENV_CONFIRMED_SLOT,
+	AB_ENV_GOOD_MASK,
+	AB_ENV_TARGET_SLOT,
+	AB_ENV_OPERATION,
+	AB_ENV_TRIES_LEFT,
+};
 
 const struct dual_boot_slot dual_boot_slots[DUAL_BOOT_MAX_SLOTS] = {
 	{
@@ -49,413 +60,960 @@ const struct dual_boot_slot dual_boot_slots[DUAL_BOOT_MAX_SLOTS] = {
 		.rootfs = CONFIG_MTK_DUAL_BOOT_SLOT_1_ROOTFS_NAME,
 #endif
 	},
-#endif /* CONFIG_MTK_DUAL_BOOT */
+#endif
 };
 
 static bool dual_boot_disabled;
-static int dual_boot_nonrst_supported = -1;
+static struct enetlite_ab_boot_decision last_decision;
+static bool last_decision_valid;
+static bool manual_trial_first_boot;
+static u32 manual_trial_first_boot_target;
+static bool manual_trial_preflight;
+static u32 manual_trial_preflight_target;
 
-static char boot_image_slot[16];
-static char upgrade_image_slot[16];
+struct env_snapshot {
+	const char *key;
+	char *value;
+};
 
 void dual_boot_disable(void)
 {
 	dual_boot_disabled = true;
 }
 
-u32 dual_boot_get_current_slot(void)
+const char *enetlite_ab_state_name(enum enetlite_ab_state_id state)
 {
-	char *end, *slot_str = env_get("dual_boot.current_slot");
-	ulong slot;
+	switch (state) {
+	case ENETLITE_AB_STABLE:
+		return "stable";
+	case ENETLITE_AB_INSTALLING:
+		return "installing";
+	case ENETLITE_AB_TRIAL:
+		return "trial";
+	default:
+		return "unknown";
+	}
+}
 
-	if (!slot_str)
-		return 0;
+const char *enetlite_ab_operation_name(enum enetlite_ab_operation op)
+{
+	switch (op) {
+	case ENETLITE_AB_OP_NONE:
+		return "none";
+	case ENETLITE_AB_OP_UPGRADE_OTHER:
+		return "upgrade-other";
+	case ENETLITE_AB_OP_UPGRADE_SAME:
+		return "upgrade-same";
+	case ENETLITE_AB_OP_MANUAL_SWITCH:
+		return "manual-switch";
+	default:
+		return "unknown";
+	}
+}
 
-	slot = simple_strtoul(slot_str, &end, 10);
-	if (end == slot_str || *end) {
-		printf("Invalid image slot number '%s', default to 0\n",
-		       slot_str);
+const char *enetlite_ab_boot_reason_name(enum enetlite_ab_boot_reason reason)
+{
+	switch (reason) {
+	case ENETLITE_AB_REASON_NORMAL:
+		return "normal";
+	case ENETLITE_AB_REASON_TRIAL:
+		return "trial";
+	case ENETLITE_AB_REASON_ROLLBACK:
+		return "rollback";
+	case ENETLITE_AB_REASON_HARD_FALLBACK:
+		return "hard-fallback";
+	case ENETLITE_AB_REASON_RECOVERY:
+		return "recovery";
+	case ENETLITE_AB_REASON_INVALID_STATE:
+		return "invalid-state";
+	default:
+		return "unknown";
+	}
+}
+
+const char *enetlite_ab_boot_path_name(enum enetlite_ab_boot_path path)
+{
+	switch (path) {
+	case ENETLITE_AB_BOOT_PATH_SLOT:
+		return "slot";
+	case ENETLITE_AB_BOOT_PATH_RECOVERY:
+		return "recovery";
+	default:
+		return "unknown";
+	}
+}
+
+static int enetlite_ab_parse_state(const char *value,
+				   enum enetlite_ab_state_id *state)
+{
+	if (!strcmp(value, "stable")) {
+		*state = ENETLITE_AB_STABLE;
 		return 0;
 	}
 
-	if (slot >= DUAL_BOOT_MAX_SLOTS) {
-		printf("Image slot number %lu is out of range, default to 0\n",
-		       slot);
+	if (!strcmp(value, "installing")) {
+		*state = ENETLITE_AB_INSTALLING;
 		return 0;
 	}
 
-	return slot;
+	if (!strcmp(value, "trial")) {
+		*state = ENETLITE_AB_TRIAL;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
-u32 dual_boot_get_next_slot(void)
+static int enetlite_ab_parse_operation(const char *value,
+				       enum enetlite_ab_operation *op)
 {
-	u32 current_slot = dual_boot_get_current_slot();
+	if (!strcmp(value, "upgrade-other")) {
+		*op = ENETLITE_AB_OP_UPGRADE_OTHER;
+		return 0;
+	}
 
-	return (current_slot + 1) % DUAL_BOOT_MAX_SLOTS;
+	if (!strcmp(value, "upgrade-same")) {
+		*op = ENETLITE_AB_OP_UPGRADE_SAME;
+		return 0;
+	}
+
+	if (!strcmp(value, "manual-switch")) {
+		*op = ENETLITE_AB_OP_MANUAL_SWITCH;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
-int dual_boot_set_current_slot(u32 slot)
+static int enetlite_ab_parse_u32_env(const char *key, u32 *value)
 {
+	const char *raw = env_get(key);
+	char *end;
+	ulong parsed;
+
+	if (!raw)
+		return -ENOENT;
+
+	parsed = simple_strtoul(raw, &end, 10);
+	if (end == raw || *end)
+		return -EINVAL;
+
+	*value = parsed;
+	return 0;
+}
+
+static int enetlite_ab_parse_int_env(const char *key, int *value)
+{
+	u32 parsed;
 	int ret;
 
-	if (slot >= DUAL_BOOT_MAX_SLOTS) {
-		printf("Invalid image slot number %u\n", slot);
+	ret = enetlite_ab_parse_u32_env(key, &parsed);
+	if (ret)
+		return ret;
+
+	*value = parsed;
+	return 0;
+}
+
+static int enetlite_ab_slot_bit(u32 slot)
+{
+	if (slot >= DUAL_BOOT_MAX_SLOTS)
+		return 0;
+
+	return 1U << slot;
+}
+
+static void enetlite_ab_set_last_decision(
+	const struct enetlite_ab_state *state, u32 actual_slot,
+	enum enetlite_ab_boot_reason reason)
+{
+	memset(&last_decision, 0, sizeof(last_decision));
+
+	last_decision.actual_slot = actual_slot;
+	last_decision.confirmed_slot = state->confirmed_slot;
+	last_decision.good_mask = state->good_mask;
+	last_decision.target_slot = state->target_slot;
+	last_decision.state = state->state;
+	last_decision.operation = state->operation;
+	last_decision.tries_left = state->tries_left;
+	last_decision.reason = reason;
+	if (reason == ENETLITE_AB_REASON_RECOVERY ||
+	    reason == ENETLITE_AB_REASON_INVALID_STATE)
+		last_decision.boot_path = ENETLITE_AB_BOOT_PATH_RECOVERY;
+	else
+		last_decision.boot_path = ENETLITE_AB_BOOT_PATH_SLOT;
+	last_decision_valid = true;
+}
+
+const struct enetlite_ab_boot_decision *enetlite_ab_last_decision(void)
+{
+	if (!last_decision_valid)
+		return NULL;
+
+	return &last_decision;
+}
+
+int enetlite_ab_state_validate(const struct enetlite_ab_state *state)
+{
+	u32 confirmed_bit;
+
+	if (!state)
+		return -EINVAL;
+
+	if (state->schema != ENETLITE_AB_SCHEMA)
+		return -EINVAL;
+
+	if (state->confirmed_slot >= DUAL_BOOT_MAX_SLOTS)
+		return -EINVAL;
+
+	if (!state->good_mask || state->good_mask & ~0x3)
+		return -EINVAL;
+
+	confirmed_bit = enetlite_ab_slot_bit(state->confirmed_slot);
+	if (!(state->good_mask & confirmed_bit))
+		return -EINVAL;
+
+	switch (state->state) {
+	case ENETLITE_AB_STABLE:
+		if (state->target_slot != -1 ||
+		    state->operation != ENETLITE_AB_OP_NONE ||
+		    state->tries_left != -1)
+			return -EINVAL;
+		return 0;
+	case ENETLITE_AB_INSTALLING:
+		if (state->target_slot < 0 ||
+		    state->target_slot >= DUAL_BOOT_MAX_SLOTS ||
+		    state->target_slot != 1 - state->confirmed_slot ||
+		    state->tries_left != -1)
+			return -EINVAL;
+
+		if (state->operation != ENETLITE_AB_OP_UPGRADE_OTHER &&
+		    state->operation != ENETLITE_AB_OP_UPGRADE_SAME)
+			return -EINVAL;
+
+		if (state->good_mask & enetlite_ab_slot_bit(state->target_slot))
+			return -EINVAL;
+
+		return 0;
+	case ENETLITE_AB_TRIAL:
+		if (state->target_slot < 0 ||
+		    state->target_slot >= DUAL_BOOT_MAX_SLOTS ||
+		    state->target_slot != 1 - state->confirmed_slot ||
+		    state->tries_left < 0 ||
+		    state->tries_left > ENETLITE_AB_MAX_TRIES)
+			return -EINVAL;
+
+		if (state->operation != ENETLITE_AB_OP_UPGRADE_OTHER &&
+		    state->operation != ENETLITE_AB_OP_UPGRADE_SAME &&
+		    state->operation != ENETLITE_AB_OP_MANUAL_SWITCH)
+			return -EINVAL;
+
+		if (state->good_mask & enetlite_ab_slot_bit(state->target_slot))
+			return -EINVAL;
+
+		return 0;
+	default:
 		return -EINVAL;
 	}
+}
 
-	ret = env_set_ulong("dual_boot.current_slot", slot);
-	if (ret) {
-		printf("Failed to set current slot in env\n");
+int enetlite_ab_state_load(struct enetlite_ab_state *state)
+{
+	const char *raw;
+	int ret;
+
+	if (!state)
+		return -EINVAL;
+
+	memset(state, 0, sizeof(*state));
+	state->target_slot = -1;
+	state->operation = ENETLITE_AB_OP_NONE;
+	state->tries_left = -1;
+
+	ret = enetlite_ab_parse_u32_env(AB_ENV_SCHEMA, &state->schema);
+	if (ret)
 		return ret;
+
+	raw = env_get(AB_ENV_STATE);
+	if (!raw)
+		return -ENOENT;
+
+	ret = enetlite_ab_parse_state(raw, &state->state);
+	if (ret)
+		return ret;
+
+	ret = enetlite_ab_parse_u32_env(AB_ENV_CONFIRMED_SLOT,
+					&state->confirmed_slot);
+	if (ret)
+		return ret;
+
+	ret = enetlite_ab_parse_u32_env(AB_ENV_GOOD_MASK, &state->good_mask);
+	if (ret)
+		return ret;
+
+	raw = env_get(AB_ENV_TARGET_SLOT);
+	if (raw) {
+		ret = enetlite_ab_parse_int_env(AB_ENV_TARGET_SLOT,
+						&state->target_slot);
+		if (ret)
+			return ret;
 	}
+
+	raw = env_get(AB_ENV_OPERATION);
+	if (raw) {
+		ret = enetlite_ab_parse_operation(raw, &state->operation);
+		if (ret)
+			return ret;
+	}
+
+	raw = env_get(AB_ENV_TRIES_LEFT);
+	if (raw) {
+		ret = enetlite_ab_parse_int_env(AB_ENV_TRIES_LEFT,
+						&state->tries_left);
+		if (ret)
+			return ret;
+	}
+
+	return enetlite_ab_state_validate(state);
+}
+
+static void enetlite_ab_apply_state_to_env(const struct enetlite_ab_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(ab_env_keys); i++)
+		env_set(ab_env_keys[i], NULL);
+
+	env_set_ulong(AB_ENV_SCHEMA, state->schema);
+	env_set(AB_ENV_STATE, enetlite_ab_state_name(state->state));
+	env_set_ulong(AB_ENV_CONFIRMED_SLOT, state->confirmed_slot);
+	env_set_ulong(AB_ENV_GOOD_MASK, state->good_mask);
+
+	if (state->target_slot >= 0)
+		env_set_ulong(AB_ENV_TARGET_SLOT, state->target_slot);
+
+	if (state->operation != ENETLITE_AB_OP_NONE)
+		env_set(AB_ENV_OPERATION,
+			enetlite_ab_operation_name(state->operation));
+
+	if (state->tries_left >= 0)
+		env_set_ulong(AB_ENV_TRIES_LEFT, state->tries_left);
+}
+
+static void enetlite_ab_snapshot_free(struct env_snapshot *snapshots,
+				      size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		free(snapshots[i].value);
+}
+
+int enetlite_ab_state_commit(const struct enetlite_ab_state *state)
+{
+	struct env_snapshot snapshots[ARRAY_SIZE(ab_env_keys)];
+	int ret;
+	size_t i;
+
+	ret = enetlite_ab_state_validate(state);
+	if (ret)
+		return ret;
+
+	memset(snapshots, 0, sizeof(snapshots));
+
+	for (i = 0; i < ARRAY_SIZE(ab_env_keys); i++) {
+		const char *value;
+
+		snapshots[i].key = ab_env_keys[i];
+		value = env_get(ab_env_keys[i]);
+		if (value) {
+			snapshots[i].value = strdup(value);
+			if (!snapshots[i].value) {
+				enetlite_ab_snapshot_free(snapshots, i);
+				return -ENOMEM;
+			}
+		}
+	}
+
+	enetlite_ab_apply_state_to_env(state);
 
 	ret = env_save();
-	if (ret)
-		printf("Failed to save env\n");
+	if (ret) {
+		for (i = 0; i < ARRAY_SIZE(ab_env_keys); i++)
+			env_set(snapshots[i].key, snapshots[i].value);
+	}
+
+	enetlite_ab_snapshot_free(snapshots, ARRAY_SIZE(ab_env_keys));
 
 	return ret;
 }
 
-bool dual_boot_is_slot_invalid(u32 slot)
+int enetlite_ab_init(u32 confirmed_slot, u32 good_mask, bool force)
 {
-	char envname[64], *val;
-
-	snprintf(envname, sizeof(envname), "dual_boot.slot_%u_invalid", slot);
-
-	val = env_get(envname);
-	if (!val)
-		return false;
-
-	if (strcmp(val, "1"))
-		return false;
-
-	return true;
-}
-
-int dual_boot_set_slot_invalid(u32 slot, bool invalid, bool save)
-{
-	char envname[64];
+	struct enetlite_ab_state current, state;
 	int ret;
 
-	snprintf(envname, sizeof(envname), "dual_boot.slot_%u_invalid", slot);
+	if (!force && !enetlite_ab_state_load(&current))
+		return -EEXIST;
 
-	ret = env_set_ulong(envname, invalid ? 1 : 0);
-	if (ret) {
-		printf("Failed to set image slot %u %s in env\n", slot,
-		       invalid ? "invalid" : "valid");
+	memset(&state, 0, sizeof(state));
+	state.schema = ENETLITE_AB_SCHEMA;
+	state.state = ENETLITE_AB_STABLE;
+	state.confirmed_slot = confirmed_slot;
+	state.good_mask = good_mask;
+	state.target_slot = -1;
+	state.operation = ENETLITE_AB_OP_NONE;
+	state.tries_left = -1;
+
+	ret = enetlite_ab_state_validate(&state);
+	if (ret)
 		return ret;
+
+	return enetlite_ab_state_commit(&state);
+}
+
+int enetlite_ab_begin_install(enum enetlite_ab_operation op, u32 actual_slot)
+{
+	struct enetlite_ab_state state;
+	u32 other;
+	int ret;
+
+	if (actual_slot >= DUAL_BOOT_MAX_SLOTS)
+		return -EINVAL;
+
+	other = 1 - actual_slot;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	if (state.state != ENETLITE_AB_STABLE ||
+	    actual_slot != state.confirmed_slot ||
+	    actual_slot >= DUAL_BOOT_MAX_SLOTS)
+		return -EINVAL;
+
+	if (op == ENETLITE_AB_OP_UPGRADE_OTHER) {
+		state.target_slot = other;
+	} else if (op == ENETLITE_AB_OP_UPGRADE_SAME) {
+		if (!(state.good_mask & enetlite_ab_slot_bit(other)))
+			return -ENODEV;
+
+		state.target_slot = actual_slot;
+		state.confirmed_slot = other;
+	} else {
+		return -EINVAL;
 	}
 
-	if (save) {
-		ret = env_save();
-		if (ret)
-			printf("Failed to save env\n");
+	state.good_mask &= ~enetlite_ab_slot_bit(state.target_slot);
+	state.state = ENETLITE_AB_INSTALLING;
+	state.operation = op;
+	state.tries_left = -1;
+
+	return enetlite_ab_state_commit(&state);
+}
+
+int enetlite_ab_activate_trial(u32 tries)
+{
+	struct enetlite_ab_state state;
+	int ret;
+
+	if (tries > ENETLITE_AB_MAX_TRIES)
+		return -EINVAL;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	if (state.state != ENETLITE_AB_INSTALLING)
+		return -EINVAL;
+
+	state.state = ENETLITE_AB_TRIAL;
+	state.tries_left = tries;
+
+	return enetlite_ab_state_commit(&state);
+}
+
+int enetlite_ab_mark_good(u32 actual_slot)
+{
+	struct enetlite_ab_state state;
+	int ret;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	if (state.state != ENETLITE_AB_TRIAL ||
+	    actual_slot != (u32)state.target_slot)
+		return -EINVAL;
+
+	state.state = ENETLITE_AB_STABLE;
+	state.confirmed_slot = actual_slot;
+	state.good_mask |= enetlite_ab_slot_bit(actual_slot);
+	state.target_slot = -1;
+	state.operation = ENETLITE_AB_OP_NONE;
+	state.tries_left = -1;
+
+	return enetlite_ab_state_commit(&state);
+}
+
+int enetlite_ab_complete_rollback(void)
+{
+	struct enetlite_ab_state state;
+	int ret;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	if (state.state != ENETLITE_AB_TRIAL)
+		return -EINVAL;
+
+	state.state = ENETLITE_AB_STABLE;
+	state.target_slot = -1;
+	state.operation = ENETLITE_AB_OP_NONE;
+	state.tries_left = -1;
+
+	return enetlite_ab_state_commit(&state);
+}
+
+int enetlite_ab_abort_install(void)
+{
+	struct enetlite_ab_state state;
+	int ret;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	if (state.state != ENETLITE_AB_INSTALLING)
+		return -EINVAL;
+
+	state.state = ENETLITE_AB_STABLE;
+	state.target_slot = -1;
+	state.operation = ENETLITE_AB_OP_NONE;
+	state.tries_left = -1;
+
+	return enetlite_ab_state_commit(&state);
+}
+
+int enetlite_ab_cancel_trial(void)
+{
+	struct enetlite_ab_state state;
+	int ret;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	switch (state.state) {
+	case ENETLITE_AB_STABLE:
+		return -ENOENT;
+	case ENETLITE_AB_INSTALLING:
+		return -EBUSY;
+	case ENETLITE_AB_TRIAL:
+		state.tries_left = 0;
+		return enetlite_ab_state_commit(&state);
+	default:
+		return -EINVAL;
 	}
+}
+
+int enetlite_ab_preflight_manual_trial(u32 target_slot)
+{
+	struct enetlite_ab_state state;
+	int ret;
+
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	if (state.state != ENETLITE_AB_STABLE ||
+	    target_slot >= DUAL_BOOT_MAX_SLOTS ||
+	    target_slot == state.confirmed_slot)
+		return -EINVAL;
+
+	manual_trial_preflight = true;
+	manual_trial_preflight_target = target_slot;
+	ret = board_boot_default(false);
+	manual_trial_preflight = false;
 
 	return ret;
 }
 
-static bool dual_boot_decode_boot_count(u32 val, u32 *retslot, u32 *retcnt)
+int enetlite_ab_start_manual_trial(u32 target_slot)
 {
-	u32 slot;
-	s8 neg, pos;
+	struct enetlite_ab_state state;
+	int ret;
 
-	/* slot: val[31..24] = -slot, val[23..16] = slot */
-	pos = (val >> 16) & 0xff;
-	neg = (val >> 24) & 0xff;
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
 
-	if (!(pos >= 0 && neg <= 0 && pos + neg == 0)) {
-		pr_debug("slot of boot count is invalid\n");
-		goto err;
-	}
-
-	slot = pos;
-
-	/* count: val[15..8] = -count, val[7..0] = count */
-	pos = val & 0xff;
-	neg = (val >> 8) & 0xff;
-
-	if (!(pos >= 0 && neg <= 0 && pos + neg == 0)) {
-		pr_debug("count of boot count is invalid\n");
-		goto err;
-	}
-
-	pr_debug("Boot count: %u of slot %u\n", pos, slot);
-
-	if (retslot)
-		*retslot = slot;
-
-	if (retcnt)
-		*retcnt = pos;
-
-	return true;
-
-err:
-	if (retslot)
-		*retslot = 0;
-
-	if (retcnt)
-		*retcnt = 0;
-
-	return false;
-}
-
-static bool dual_boot_read_boot_count_raw(u32 *retraw)
-{
-#ifdef CONFIG_ARCH_MEDIATEK
-	struct arm_smccc_res res = {0};
-
-	arm_smccc_smc(MTK_SIP_READ_NONRST_REG, 0, 0, 0, 0, 0, 0, 0, &res);
-
-	*retraw = (u32)res.a0;
-	pr_debug("read boot count: 0x%08x\n", *retraw);
-
-	if (*retraw == MTK_SIP_SMC_UNK)
-		return false;
-
-	return true;
-#else
-	*retraw = 0;
-	return false;
-#endif
-}
-
-static bool dual_boot_nonrst_is_supported(void)
-{
-	u32 raw;
-
-	if (dual_boot_nonrst_supported >= 0)
-		return dual_boot_nonrst_supported;
-
-	if (!dual_boot_read_boot_count_raw(&raw)) {
-		printf("Non-reset SMC is not supported. Retry will be disabled.\n");
-		dual_boot_nonrst_supported = 0;
-		return false;
-	}
-
-	dual_boot_nonrst_supported = 1;
-	return true;
-}
-
-bool dual_boot_get_boot_count(u32 *retslot, u32 *retcnt)
-{
-	u32 raw;
-
-	if (!dual_boot_nonrst_is_supported())
-		goto err;
-
-	if (!dual_boot_read_boot_count_raw(&raw))
-		goto err;
-
-	return dual_boot_decode_boot_count(raw, retslot, retcnt);
-
-err:
-	if (retslot)
-		*retslot = 0;
-
-	if (retcnt)
-		*retcnt = 0;
-
-	return false;
-}
-
-int dual_boot_set_boot_count(u32 slot, u32 count)
-{
-#ifdef CONFIG_ARCH_MEDIATEK
-	struct arm_smccc_res res = {0};
-	u32 val, verify_raw;
-	u32 verify_slot = 0, verify_count = 0;
-	s32 neg;
-
-	if (slot > 127 || count > 127)
+	if (state.state != ENETLITE_AB_STABLE ||
+	    target_slot >= DUAL_BOOT_MAX_SLOTS ||
+	    target_slot == state.confirmed_slot)
 		return -EINVAL;
 
-	if (!dual_boot_nonrst_is_supported())
-		return -EOPNOTSUPP;
+	state.state = ENETLITE_AB_TRIAL;
+	state.target_slot = target_slot;
+	state.operation = ENETLITE_AB_OP_MANUAL_SWITCH;
+	state.tries_left = ENETLITE_AB_MAX_TRIES - 1;
+	state.good_mask &= ~enetlite_ab_slot_bit(target_slot);
 
-	pr_debug("Set boot count: %u of slot %u\n", count, slot);
+	ret = enetlite_ab_state_commit(&state);
+	if (ret)
+		return ret;
 
-	neg = -count;
-	val = count | ((neg << 8) & 0xff00);
-
-	neg = -slot;
-	val = val | ((uint32_t)slot << 16) | ((neg << 24) & 0xff000000);
-
-	pr_debug("write boot count: 0x%08x\n", val);
-
-	arm_smccc_smc(MTK_SIP_WRITE_NONRST_REG, 0, val, 0, 0, 0, 0, 0, &res);
-
-	if (!dual_boot_read_boot_count_raw(&verify_raw)) {
-		printf("Failed to verify boot count write: non-reset SMC unavailable\n");
-		dual_boot_nonrst_supported = 0;
-		return -EIO;
-	}
-
-	if (!dual_boot_decode_boot_count(verify_raw, &verify_slot, &verify_count) ||
-	    verify_slot != slot || verify_count != count) {
-		printf("Failed to verify boot count write: expected slot %u count %u, got raw 0x%08x\n",
-		       slot, count, verify_raw);
-		dual_boot_nonrst_supported = 0;
-		return -EIO;
-	}
+	manual_trial_first_boot = true;
+	manual_trial_first_boot_target = target_slot;
 
 	return 0;
-#else
-	return -EOPNOTSUPP;
-#endif
+}
+
+u32 enetlite_ab_get_confirmed_slot(void)
+{
+	struct enetlite_ab_state state;
+
+	if (enetlite_ab_state_load(&state))
+		return 0;
+
+	return state.confirmed_slot;
+}
+
+u32 enetlite_ab_get_inactive_slot(void)
+{
+	u32 confirmed_slot = enetlite_ab_get_confirmed_slot();
+
+	return (confirmed_slot + 1) % DUAL_BOOT_MAX_SLOTS;
+}
+
+static int enetlite_ab_boot_slot(struct dual_boot_priv *priv,
+				 struct enetlite_ab_state *state, u32 slot,
+				 enum enetlite_ab_boot_reason reason,
+				 bool do_boot)
+{
+	enetlite_ab_set_last_decision(state, slot, reason);
+	return priv->boot_slot(priv, slot, do_boot);
+}
+
+static int enetlite_ab_try_confirmed(struct dual_boot_priv *priv,
+				     struct enetlite_ab_state *state,
+				     enum enetlite_ab_boot_reason reason,
+				     bool do_boot)
+{
+	return enetlite_ab_boot_slot(priv, state, state->confirmed_slot, reason,
+				     do_boot);
 }
 
 int dual_boot(struct dual_boot_priv *priv, bool do_boot)
 {
-	u32 slot, bootcount = 0, maxcount = 0;
-	int ret;
+	struct enetlite_ab_state state, old_state;
+	u32 other;
+	int ret, saved_ret;
 
-	slot = dual_boot_get_current_slot();
-
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
-		u32 last_slot;
-		bool bcvalid;
-
-		/* Avoid compilation error */
-#ifdef CONFIG_MTK_DUAL_BOOT_MAX_RETRY_COUNT
-		maxcount = CONFIG_MTK_DUAL_BOOT_MAX_RETRY_COUNT;
-#endif
-
-		if (maxcount < 1)
-			maxcount = 1;
-
-		bcvalid = dual_boot_get_boot_count(&last_slot, &bootcount);
-
-		if (!dual_boot_nonrst_is_supported()) {
-			maxcount = 0;
-			bootcount = 0;
-		} else if (!bcvalid) {
-#ifdef CONFIG_ARCH_MEDIATEK
-			printf("Boot count is invalid. Assuming cold boot\n");
-#endif
-			bootcount = 0;
-		} else if (slot != last_slot) {
-#ifdef CONFIG_ARCH_MEDIATEK
-			printf("Boot count belongs to image slot %u, current image slot is %u. Assuming cold boot\n",
-			       last_slot, slot);
-#endif
-			bootcount = 0;
-		}
+	ret = enetlite_ab_state_load(&state);
+	if (ret) {
+		memset(&state, 0, sizeof(state));
+		state.schema = ENETLITE_AB_SCHEMA;
+		state.state = ENETLITE_AB_STABLE;
+		state.confirmed_slot = 0;
+		state.good_mask = 1;
+		state.target_slot = -1;
+		state.operation = ENETLITE_AB_OP_NONE;
+		state.tries_left = -1;
+		enetlite_ab_set_last_decision(&state, 0,
+					       ENETLITE_AB_REASON_INVALID_STATE);
+		printf("A/B state is invalid, refusing to guess a boot slot (%d)\n",
+		       ret);
+		return ret;
 	}
 
-	if (dual_boot_is_slot_invalid(slot)) {
-		printf("Image slot %u was marked invalid.\n", slot);
-	} else {
-		if (bootcount) {
-			printf("Image slot %u has tried booting for %u times.\n",
-			       slot, bootcount);
+	switch (state.state) {
+	case ENETLITE_AB_STABLE:
+		if (manual_trial_preflight && !do_boot &&
+		    manual_trial_preflight_target < DUAL_BOOT_MAX_SLOTS &&
+		    manual_trial_preflight_target != state.confirmed_slot) {
+			state.state = ENETLITE_AB_TRIAL;
+			state.target_slot = manual_trial_preflight_target;
+			state.operation = ENETLITE_AB_OP_MANUAL_SWITCH;
+			state.tries_left = ENETLITE_AB_MAX_TRIES - 1;
+			state.good_mask &= ~enetlite_ab_slot_bit(state.target_slot);
+
+			printf("A/B manual trial preflight slot %u\n",
+			       state.target_slot);
+			return enetlite_ab_boot_slot(priv, &state,
+						    state.target_slot,
+						    ENETLITE_AB_REASON_TRIAL,
+						    false);
 		}
 
-		if (maxcount && bootcount >= maxcount) {
-			printf("Maximum retries (%u) exceeded with image slot %u\n",
-			       maxcount, slot);
-		} else {
-			if (maxcount) {
-				printf("Setting image slot %u with boot count %u\n",
-				       slot, bootcount + 1);
-				if (dual_boot_set_boot_count(slot, bootcount + 1)) {
-					printf("Failed to persist boot count for image slot %u\n",
-					       slot);
-					maxcount = 0;
-				}
-			}
+		ret = enetlite_ab_try_confirmed(priv, &state,
+						ENETLITE_AB_REASON_NORMAL,
+						do_boot);
+		if (!ret || !do_boot)
+			return ret;
 
-			ret = priv->boot_slot(priv, slot, do_boot);
-			if (!ret && !do_boot)
-				return 0;
-
-			printf("Failed to boot from current image slot, error %d\n",
-			       ret);
-		}
-
-		printf("Image slot %u will be marked invalid.\n", slot);
-
-		dual_boot_set_slot_invalid(slot, true, true);
-	}
-
-	slot = dual_boot_get_next_slot();
-
-	if (dual_boot_is_slot_invalid(slot)) {
-		printf("Image slot %u was marked invalid.\n", slot);
-	} else {
-		ret = dual_boot_set_current_slot(slot);
-		if (ret) {
-			panic("Error: failed to set new image boot slot, error %d\n",
-			      ret);
+		other = 1 - state.confirmed_slot;
+		if (!(state.good_mask & enetlite_ab_slot_bit(other))) {
+			printf("Confirmed slot %u failed and no known-good fallback exists\n",
+			       state.confirmed_slot);
+			enetlite_ab_set_last_decision(&state, 0,
+						       ENETLITE_AB_REASON_RECOVERY);
 			return ret;
 		}
 
-		if (maxcount) {
-			printf("Setting image slot %u with boot count 1\n", slot);
-			if (dual_boot_set_boot_count(slot, 1)) {
-				printf("Failed to persist boot count for image slot %u\n",
-				       slot);
-				maxcount = 0;
+		printf("Confirmed slot %u failed, hard-fallback to slot %u\n",
+		       state.confirmed_slot, other);
+
+		state.good_mask &= ~enetlite_ab_slot_bit(state.confirmed_slot);
+		state.confirmed_slot = other;
+		state.target_slot = -1;
+		state.operation = ENETLITE_AB_OP_NONE;
+		state.tries_left = -1;
+
+		saved_ret = enetlite_ab_state_commit(&state);
+		if (saved_ret) {
+			printf("Failed to persist hard-fallback state: %d\n",
+			       saved_ret);
+			return ret;
+		}
+
+		ret = enetlite_ab_try_confirmed(priv, &state,
+						ENETLITE_AB_REASON_HARD_FALLBACK,
+						do_boot);
+		if (ret && do_boot) {
+			printf("Hard-fallback slot %u failed, entering recovery\n",
+			       state.confirmed_slot);
+			enetlite_ab_set_last_decision(&state, 0,
+						       ENETLITE_AB_REASON_RECOVERY);
+		}
+
+		return ret;
+	case ENETLITE_AB_INSTALLING:
+		printf("A/B install incomplete, booting confirmed slot %u\n",
+		       state.confirmed_slot);
+		ret = enetlite_ab_try_confirmed(priv, &state,
+						ENETLITE_AB_REASON_NORMAL,
+						do_boot);
+		if (ret && do_boot) {
+			printf("Confirmed slot %u failed during installing state, entering recovery\n",
+			       state.confirmed_slot);
+			enetlite_ab_set_last_decision(&state, 0,
+						       ENETLITE_AB_REASON_RECOVERY);
+		}
+
+		return ret;
+	case ENETLITE_AB_TRIAL:
+		if (state.tries_left <= 0) {
+			printf("A/B trial exhausted, rolling back to slot %u\n",
+			       state.confirmed_slot);
+			ret = enetlite_ab_boot_slot(priv, &state,
+						    state.confirmed_slot,
+						    ENETLITE_AB_REASON_ROLLBACK,
+						    do_boot);
+			if (ret && do_boot) {
+				printf("Rollback slot %u failed, entering recovery\n",
+				       state.confirmed_slot);
+				enetlite_ab_set_last_decision(&state, 0,
+							       ENETLITE_AB_REASON_RECOVERY);
+			}
+
+			return ret;
+		}
+
+		if (manual_trial_first_boot &&
+		    state.operation == ENETLITE_AB_OP_MANUAL_SWITCH &&
+		    state.target_slot == manual_trial_first_boot_target &&
+		    state.tries_left == ENETLITE_AB_MAX_TRIES - 1) {
+			if (do_boot)
+				manual_trial_first_boot = false;
+
+			printf("A/B manual trial boot slot %u, tries left: %d\n",
+			       state.target_slot, state.tries_left);
+			ret = enetlite_ab_boot_slot(priv, &state, state.target_slot,
+						    ENETLITE_AB_REASON_TRIAL, do_boot);
+			if (!ret || !do_boot)
+				return ret;
+
+			printf("A/B manual trial slot %u failed before Linux handoff, rolling back to slot %u\n",
+			       state.target_slot, state.confirmed_slot);
+			state.tries_left = 0;
+			saved_ret = enetlite_ab_state_commit(&state);
+			if (saved_ret)
+				printf("Failed to persist manual trial rollback: %d\n",
+				       saved_ret);
+
+			ret = enetlite_ab_try_confirmed(priv, &state,
+							ENETLITE_AB_REASON_ROLLBACK,
+							do_boot);
+			if (ret && do_boot) {
+				printf("Rollback slot %u failed, entering recovery\n",
+				       state.confirmed_slot);
+				enetlite_ab_set_last_decision(&state, 0,
+							       ENETLITE_AB_REASON_RECOVERY);
+			}
+
+			return ret;
+		}
+
+		old_state = state;
+		state.tries_left--;
+
+		if (do_boot) {
+			ret = enetlite_ab_state_commit(&state);
+			if (ret) {
+				printf("Failed to persist A/B trial decrement: %d\n",
+				       ret);
+				ret = enetlite_ab_boot_slot(
+					priv, &old_state, old_state.confirmed_slot,
+					ENETLITE_AB_REASON_ROLLBACK,
+					do_boot);
+				if (ret && do_boot) {
+					printf("Rollback slot %u failed, entering recovery\n",
+					       old_state.confirmed_slot);
+					enetlite_ab_set_last_decision(
+						&old_state, 0,
+						ENETLITE_AB_REASON_RECOVERY);
+				}
+
+				return ret;
 			}
 		}
 
-		ret = priv->boot_slot(priv, slot, do_boot);
-			if (!ret && !do_boot)
-				return 0;
+		printf("A/B trial boot slot %u, tries left after pre-decrement: %d\n",
+		       state.target_slot, state.tries_left);
+		ret = enetlite_ab_boot_slot(priv, &state, state.target_slot,
+					    ENETLITE_AB_REASON_TRIAL, do_boot);
+		if (!ret || !do_boot)
+			return ret;
 
-		printf("Failed to boot from next image slot, error %d\n", ret);
-		printf("Image slot %u will be marked invalid.\n", slot);
+		printf("A/B trial slot %u failed before Linux handoff, rolling back to slot %u\n",
+		       state.target_slot, state.confirmed_slot);
 
-		dual_boot_set_slot_invalid(slot, true, true);
+		if (do_boot) {
+			old_state = state;
+			state.tries_left = 0;
+			saved_ret = enetlite_ab_state_commit(&state);
+			if (saved_ret) {
+				printf("Failed to persist trial failure rollback: %d\n",
+				       saved_ret);
+				state = old_state;
+			}
+		}
+
+		ret = enetlite_ab_try_confirmed(priv, &state,
+						ENETLITE_AB_REASON_ROLLBACK,
+						do_boot);
+		if (ret && do_boot) {
+			printf("Rollback slot %u failed, entering recovery\n",
+			       state.confirmed_slot);
+			enetlite_ab_set_last_decision(&state, 0,
+						       ENETLITE_AB_REASON_RECOVERY);
+		}
+
+		return ret;
+	default:
+		return -EINVAL;
 	}
+}
 
-	return ret;
+static const char *enetlite_ab_overlay_volume(u32 slot)
+{
+	if (slot < DUAL_BOOT_MAX_SLOTS && dual_boot_slots[slot].rootfs_data)
+		return dual_boot_slots[slot].rootfs_data;
+
+	return PART_ROOTFS_DATA_NAME;
 }
 
 static int dual_boot_set_default_bootargs(void)
 {
-	u32 slot;
+	const struct enetlite_ab_boot_decision *decision;
+	static char actual_slot[16], confirmed_slot[16];
 
-	slot = dual_boot_get_current_slot();
-	snprintf(boot_image_slot, sizeof(boot_image_slot), "%u", slot);
-	if (bootargs_set("boot_param.boot_image_slot", boot_image_slot))
+	decision = enetlite_ab_last_decision();
+	if (!decision)
+		return 0;
+
+	snprintf(actual_slot, sizeof(actual_slot), "%u",
+		 decision->actual_slot);
+	snprintf(confirmed_slot, sizeof(confirmed_slot), "%u",
+		 decision->confirmed_slot);
+
+	if (bootargs_set("boot_param.enetlite_actual_boot_slot", actual_slot))
 		return -1;
 
-	slot = dual_boot_get_next_slot();
-	snprintf(upgrade_image_slot, sizeof(upgrade_image_slot), "%u", slot);
-	if (bootargs_set("boot_param.upgrade_image_slot", upgrade_image_slot))
+	if (bootargs_set("boot_param.enetlite_confirmed_slot", confirmed_slot))
 		return -1;
-
-	if (bootargs_set("boot_param.dual_boot", NULL))
-		return -1;
-
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
-		if (bootargs_set("boot_param.reset_boot_count", NULL))
-			return -1;
-	}
 
 	return 0;
 }
 
 static int dual_boot_set_fdt_defaults(void *fdt)
 {
-	u32 slot;
+	const struct enetlite_ab_boot_decision *decision;
+	const char *operation, *ab_state;
 
-	slot = dual_boot_get_current_slot();
-	rootdisk_set_fitblk_rootfs(fdt, dual_boot_slots[slot].kernel);
+	decision = enetlite_ab_last_decision();
+	if (!decision)
+		return 0;
 
-	if (fdtargs_set_u32("mediatek,boot-image-slot", slot))
+	if (decision->boot_path == ENETLITE_AB_BOOT_PATH_SLOT)
+		rootdisk_set_fitblk_rootfs(fdt,
+					   dual_boot_slots[decision->actual_slot].kernel);
+
+	if (fdtargs_set_u32("enetlite,ab-abi-version", 1))
 		return -1;
 
-	slot = dual_boot_get_next_slot();
-	if (fdtargs_set_u32("mediatek,upgrade-image-slot", slot))
+	if (fdtargs_set("enetlite,boot-path",
+			enetlite_ab_boot_path_name(decision->boot_path)))
 		return -1;
 
-	if (fdtargs_set("mediatek,dual-boot", NULL))
+	if (decision->reason == ENETLITE_AB_REASON_INVALID_STATE)
+		ab_state = "invalid";
+	else
+		ab_state = enetlite_ab_state_name(decision->state);
+
+	if (fdtargs_set("enetlite,ab-state", ab_state))
 		return -1;
 
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
-		if (fdtargs_set("mediatek,reset-boot-count", NULL))
+	if (decision->boot_path == ENETLITE_AB_BOOT_PATH_SLOT) {
+		if (fdtargs_set_u32("enetlite,actual-boot-slot",
+				    decision->actual_slot))
+			return -1;
+		if (fdtargs_set_u32("enetlite,confirmed-slot",
+				    decision->confirmed_slot))
+			return -1;
+		if (fdtargs_set_u32("enetlite,good-mask",
+				    decision->good_mask))
+			return -1;
+
+		if (decision->target_slot >= 0 &&
+		    fdtargs_set_u32("enetlite,target-slot",
+				    decision->target_slot))
+			return -1;
+
+		operation = enetlite_ab_operation_name(decision->operation);
+		if (decision->operation != ENETLITE_AB_OP_NONE &&
+		    fdtargs_set("enetlite,operation", operation))
+			return -1;
+
+		if (decision->state == ENETLITE_AB_TRIAL &&
+		    fdtargs_set_u32("enetlite,tries-left",
+				    decision->tries_left))
+			return -1;
+	}
+
+	if (fdtargs_set("enetlite,boot-reason",
+			enetlite_ab_boot_reason_name(decision->reason)))
+		return -1;
+	if (fdtargs_set("enetlite,reset-reason", "unknown"))
+		return -1;
+	if (decision->boot_path == ENETLITE_AB_BOOT_PATH_SLOT) {
+		if (fdtargs_set("enetlite,boot-firmware-volume",
+				dual_boot_slots[decision->actual_slot].kernel))
+			return -1;
+		if (fdtargs_set("enetlite,boot-overlay-volume",
+				enetlite_ab_overlay_volume(decision->actual_slot)))
 			return -1;
 	}
 
@@ -479,4 +1037,3 @@ int dual_boot_set_defaults(void *fdt)
 
 	return ret;
 }
-

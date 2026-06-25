@@ -48,7 +48,7 @@ endif
 
 obj-$(CONFIG_MTK_ANTI_ROLLBACK) += mtk_ar.o mtk_efuse.o
 
-obj-$(CONFIG_MTK_DUAL_BOOT) += dual_boot.o
+obj-$(CONFIG_MTK_DUAL_BOOT) += dual_boot.o cmd_enetab.o
 
 obj-$(CONFIG_ENABLE_NAND_NMBM) += nmbm.o
 
@@ -56,4 +56,3 @@ obj-$(CONFIG_MTK_MISC_CUSTOMIZED) += customizations/
 
 obj-$(CONFIG_MTK_FW_ENCRYPT_VIA_BL31) += mtk_aes_decrypt.o
 obj-$(CONFIG_MTK_FW_ENCRYPT_VIA_OPTEE) += mtk_optee_aes_decrypt.o
-

@@ -17,6 +17,9 @@ static int do_mtkboardboot(struct cmd_tbl *cmdtp, int flag, int argc,
 {
 	int ret = CMD_RET_SUCCESS;
 
+	if (IS_ENABLED(CONFIG_CMD_WPS_SLOT_SWITCH))
+		run_command("wpsslot", 0);
+
 	ret = board_boot_default(true);
 	if (ret)
 		ret = CMD_RET_FAILURE;

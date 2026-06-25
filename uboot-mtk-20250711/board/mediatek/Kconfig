@@ -334,37 +334,23 @@ config MTK_DUAL_BOOT_ITB_IMAGE
 	  rootfs can be verified once, without the need of modifying the FIT
 	  tree to insert the hashes of rootfs.
 
-config MTK_DUAL_BOOT_ENABLE_RETRY
-	bool "Enable boot retry"
-	default n
-	depends on ARCH_MEDIATEK
-	help
-	  Enable boot retry functionality. U-Boot will keep a persist
-	  boot-count value which will only be reset by a cold reset.
-	  The boot-count will be increased by one before each boot attempt.
-	  If the image boots up normally, it must reset the boot-count value
-	  to zero.
-	  Once U-Boot found that boot-count is larger than max retry count, the
-	  current slot will be marked invalid.
-
 config CMD_WPS_SLOT_SWITCH
 	bool "Enable WPS/Mesh button A/B slot switch command"
 	depends on BUTTON
 	default n
 	help
 	  Enable the wpsslot command. When the reset and WPS/Mesh buttons are
-	  held together during U-Boot startup, the command clears the next A/B
-	  slot invalid flag, resets its bootcount when possible, and switches
-	  current_slot to it. Holding only the WPS/Mesh button does not switch
-	  slots.
+	  held together during U-Boot startup, the command starts a manual
+	  A/B trial boot of the other slot. Holding only the WPS/Mesh button
+	  does not switch slots.
 
-config MTK_DUAL_BOOT_MAX_RETRY_COUNT
-	int "Max boot retry count"
-	range 2 127
+config ENETLITE_AB_MAX_TRIES
+	int "EnetLite A/B trial boot attempts"
+	range 1 127
 	default 3
-	depends on MTK_DUAL_BOOT_ENABLE_RETRY
 	help
-	  The maximum boot retry count
+	  Maximum number of U-Boot trial boots before rolling back to the
+	  confirmed A/B slot.
 
 config MTK_DUAL_BOOT_SLOT_1_FIRMWARE_NAME
 	string "Name of firmware image slot 1"
@@ -440,16 +426,6 @@ config MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA
 	  during OpenWrt sysupgrade, even if 'keep settings' is deselected.
 	  This option is valid only if rootfs_data is shared. For UBI, the
 	  shared rootfs_data must also have limited size.
-
-config MTK_DUAL_BOOT_ALLOW_SHARED_DATA_RECLAIM
-	bool "Allow deleting shared_data to make room during U-Boot upgrades"
-	default n
-	depends on MTK_DUAL_BOOT && MTD_UBI
-	help
-	  Enable this only for recovery or factory builds where completing a
-	  U-Boot-side firmware upgrade is more important than preserving data
-	  in the shared_data UBI volume. When disabled, U-Boot will fail the
-	  upgrade with ENOSPC instead of deleting shared_data.
 
 config MTK_DUAL_BOOT_EMERG_IMAGE
 	bool "Enable booting emergency image if both slots failed"

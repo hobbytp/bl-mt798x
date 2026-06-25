@@ -8,6 +8,7 @@
 
 #include <button.h>
 #include <command.h>
+#include <linux/errno.h>
 #include <linux/delay.h>
 #include <time.h>
 
@@ -21,31 +22,36 @@
 
 static int wpsslot_switch_to_next_slot(void)
 {
-	u32 current_slot, target_slot;
+	u32 confirmed_slot, target_slot;
 	int ret;
 
-	current_slot = dual_boot_get_current_slot();
-	target_slot = dual_boot_get_next_slot();
-
-	printf("WPS/Mesh recovery: switching A/B slot %u -> %u\n",
-	       current_slot, target_slot);
-
-	ret = dual_boot_set_slot_invalid(target_slot, false, false);
-	if (ret)
-		return ret;
-
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
-		ret = dual_boot_set_boot_count(target_slot, 0);
-		if (ret)
-			printf("Warning: failed to reset bootcount for slot %u (%d)\n",
-			       target_slot, ret);
+	ret = enetlite_ab_cancel_trial();
+	if (!ret) {
+		printf("WPS/Mesh recovery: active A/B trial cancelled; confirmed slot will boot as rollback\n");
+		return 0;
 	}
 
-	ret = dual_boot_set_current_slot(target_slot);
+	if (ret != -ENOENT)
+		return ret;
+
+	confirmed_slot = enetlite_ab_get_confirmed_slot();
+	target_slot = enetlite_ab_get_inactive_slot();
+
+	printf("WPS/Mesh recovery: switching A/B slot %u -> %u\n",
+	       confirmed_slot, target_slot);
+
+	ret = enetlite_ab_preflight_manual_trial(target_slot);
+	if (ret) {
+		printf("WPS/Mesh recovery: target slot %u preflight failed (%d)\n",
+		       target_slot, ret);
+		return ret;
+	}
+
+	ret = enetlite_ab_start_manual_trial(target_slot);
 	if (ret)
 		return ret;
 
-	printf("WPS/Mesh recovery: slot %u selected for next boot\n",
+	printf("WPS/Mesh recovery: slot %u selected for trial boot\n",
 	       target_slot);
 
 	return 0;

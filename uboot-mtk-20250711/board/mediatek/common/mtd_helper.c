@@ -39,6 +39,8 @@
 
 #define UBI_MOUNT_RECREATE	(!IS_ENABLED(CONFIG_MTK_DUAL_BOOT) && \
 				 !IS_ENABLED(CONFIG_MTK_BOOTMENU_UBI))
+#define UBI_UPGRADE_RECREATE	(IS_ENABLED(CONFIG_MTK_DUAL_BOOT) || \
+				 UBI_MOUNT_RECREATE)
 
 struct dual_boot_mtd_priv {
 	struct dual_boot_priv db;
@@ -55,15 +57,7 @@ static char fitvol[BOOT_PARAM_STR_MAX_LEN];
 static char ubi_root_path[BOOT_PARAM_STR_MAX_LEN];
 
 #ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
-#define DUAL_BOOT_ROOTFS_DATA_SIZE_MIN_MIB	64
-#define DUAL_BOOT_ROOTFS_DATA_SIZE_MAX_MIB	256
-#define DUAL_BOOT_SHARED_DATA_SIZE_MIN_MIB	32
-#define DUAL_BOOT_SHARED_DATA_SIZE_MAX_MIB	128
 #define DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB	64
-#define SHARED_DATA_SIZE_MIB		88
-
-static char rootfs_data_size_limit[BOOT_PARAM_STR_MAX_LEN];
-static char shared_data_size_limit[BOOT_PARAM_STR_MAX_LEN];
 
 struct rootfs_data_volume_state {
 	const char *name;
@@ -74,19 +68,6 @@ struct rootfs_data_volume_state {
 
 static u32 dual_boot_rootfs_data_size_mib(void)
 {
-	const char *value = env_get(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV);
-	unsigned long mib;
-
-	if (value && !strict_strtoul(value, 10, &mib) &&
-	    mib >= DUAL_BOOT_ROOTFS_DATA_SIZE_MIN_MIB &&
-	    mib <= DUAL_BOOT_ROOTFS_DATA_SIZE_MAX_MIB)
-		return mib;
-
-	if (value)
-		printf("Warning: invalid %s=%s, using default %d\n",
-		       DUAL_BOOT_ROOTFS_DATA_SIZE_ENV, value,
-		       CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE);
-
 	return CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE;
 }
 
@@ -95,46 +76,6 @@ static u64 dual_boot_rootfs_data_size_bytes(void)
 	return (u64)dual_boot_rootfs_data_size_mib() << 20;
 }
 
-static u32 dual_boot_shared_data_size_mib(void)
-{
-	const char *value = env_get(DUAL_BOOT_SHARED_DATA_SIZE_ENV);
-	unsigned long mib;
-
-	if (value && !strict_strtoul(value, 10, &mib) &&
-	    mib >= DUAL_BOOT_SHARED_DATA_SIZE_MIN_MIB &&
-	    mib <= DUAL_BOOT_SHARED_DATA_SIZE_MAX_MIB)
-		return mib;
-
-	if (value)
-		printf("Warning: invalid %s=%s, using default %d\n",
-		       DUAL_BOOT_SHARED_DATA_SIZE_ENV, value,
-		       SHARED_DATA_SIZE_MIB);
-
-	return SHARED_DATA_SIZE_MIB;
-}
-
-static u64 dual_boot_shared_data_size_bytes(void)
-{
-	return (u64)dual_boot_shared_data_size_mib() << 20;
-}
-
-static int dual_boot_seed_rootfs_data_size_env(void)
-{
-	if (env_get(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV))
-		return 0;
-
-	return env_set_ulong(DUAL_BOOT_ROOTFS_DATA_SIZE_ENV,
-			     CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE);
-}
-
-static int dual_boot_seed_shared_data_size_env(void)
-{
-	if (env_get(DUAL_BOOT_SHARED_DATA_SIZE_ENV))
-		return 0;
-
-	return env_set_ulong(DUAL_BOOT_SHARED_DATA_SIZE_ENV,
-			     SHARED_DATA_SIZE_MIB);
-}
 #endif
 
 static const char *ubi_image_vol;
@@ -791,13 +732,10 @@ static u64 dual_boot_firmware_size_max_bytes(void)
 	return (u64)DUAL_BOOT_FIRMWARE_SIZE_MAX_MIB << 20;
 }
 
-static int shared_data_reclaim_if_needed(int required_pebs,
-					 int reclaimable_pebs,
-					 const char *reason)
+static int shared_data_check_space(int required_pebs, int reclaimable_pebs,
+				   const char *reason)
 {
 	struct ubi_device *ubi = ubi_devices[0];
-	struct ubi_volume *vol;
-	int ret;
 
 	if (!ubi)
 		return -ENODEV;
@@ -805,30 +743,10 @@ static int shared_data_reclaim_if_needed(int required_pebs,
 	if (ubi->avail_pebs + reclaimable_pebs >= required_pebs)
 		return 0;
 
-	vol = ubi_find_volume((char *)PART_SHARED_DATA_NAME);
-	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ALLOW_SHARED_DATA_RECLAIM)) {
-		printf("Error: not enough UBI space for %s: required=%d PEBs, available=%d PEBs, reclaimable=%d PEBs; preserving %s\n",
-		       reason, required_pebs, ubi->avail_pebs,
-		       reclaimable_pebs, PART_SHARED_DATA_NAME);
-		return -ENOSPC;
-	}
-
-	if (!vol) {
-		printf("Error: not enough UBI space for %s: required=%d PEBs, available=%d PEBs, reclaimable=%d PEBs; %s is not present\n",
-		       reason, required_pebs, ubi->avail_pebs,
-		       reclaimable_pebs, PART_SHARED_DATA_NAME);
-		return -ENOSPC;
-	}
-
-	printf("Warning: removing %s (%d PEBs) to make room for %s\n",
-	       PART_SHARED_DATA_NAME, vol->reserved_pebs, reason);
-
-	ret = remove_ubi_volume(PART_SHARED_DATA_NAME);
-	if (ret)
-		cprintln(ERROR, "*** Failed to remove %s, err = %d ***",
-			 PART_SHARED_DATA_NAME, ret);
-
-	return ret;
+	printf("Error: not enough UBI space for %s: required=%d PEBs, available=%d PEBs, reclaimable=%d PEBs; preserving %s\n",
+	       reason, required_pebs, ubi->avail_pebs,
+	       reclaimable_pebs, PART_SHARED_DATA_NAME);
+	return -ENOSPC;
 }
 
 static int shared_data_ensure_firmware_space(const char *firmware_part,
@@ -871,8 +789,8 @@ static int shared_data_ensure_firmware_space(const char *firmware_part,
 		}
 	}
 
-	return shared_data_reclaim_if_needed(required_pebs, reclaimable_pebs,
-					     "firmware upgrade");
+	return shared_data_check_space(required_pebs, reclaimable_pebs,
+				       "firmware upgrade");
 }
 
 static void rootfs_data_read_state(const char *name,
@@ -998,8 +916,8 @@ static int rootfs_data_normalize_single(const char *name, u64 target_size,
 	if (state.exists)
 		reclaimable_pebs = state.reserved_pebs;
 
-	ret = shared_data_reclaim_if_needed(target_pebs, reclaimable_pebs,
-					    "shared rootfs_data normalization");
+	ret = shared_data_check_space(target_pebs, reclaimable_pebs,
+				      "shared rootfs_data normalization");
 	if (ret)
 		return ret;
 
@@ -1054,8 +972,8 @@ static int rootfs_data_normalize_pair(const char *reason, const char *volume,
 	if (rootfs_data2.exists)
 		reclaimable_pebs += rootfs_data2.reserved_pebs;
 
-	ret = shared_data_reclaim_if_needed(target_pebs * 2, reclaimable_pebs,
-					    "A/B rootfs_data normalization");
+	ret = shared_data_check_space(target_pebs * 2, reclaimable_pebs,
+				      "A/B rootfs_data normalization");
 	if (ret)
 		return ret;
 
@@ -1165,7 +1083,7 @@ static int mtd_dual_boot_ensure_rootfs_data(u32 slot, const char *rootfs_data,
 		if (target_pebs < 0)
 			return target_pebs;
 
-		ret = shared_data_reclaim_if_needed(
+		ret = shared_data_check_space(
 			target_pebs,
 			target_state.exists ? target_state.reserved_pebs : 0,
 			"target rootfs_data refresh");
@@ -1373,9 +1291,6 @@ static int write_ubi1_tar_image(const void *data, size_t size,
 
 static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 {
-#ifndef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
-	struct ubi_volume *vol = NULL;
-#endif
 	int ret;
 
 #ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
@@ -1386,61 +1301,48 @@ static int mtd_dual_boot_post_upgrade(u32 slot, const char *rootfs_data)
 		return ret;
 	}
 
-	ret = dual_boot_seed_rootfs_data_size_env();
-	if (ret)
-		printf("Warning: failed to seed %s in env, error %d\n",
-		       DUAL_BOOT_ROOTFS_DATA_SIZE_ENV, ret);
-
-	ret = dual_boot_seed_shared_data_size_env();
-	if (ret)
-		printf("Warning: failed to seed %s in env, error %d\n",
-		       DUAL_BOOT_SHARED_DATA_SIZE_ENV, ret);
 #else
-	ret = dual_boot_set_slot_invalid(slot, false, false);
-	if (ret)
-		printf("Error: failed to set new image slot valid in env\n");
-
-	ret = dual_boot_set_current_slot(slot);
-	if (ret)
-		printf("Error: failed to save new image slot to env\n");
-
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
-		printf("Resetting boot count of image slot %u to 0\n", slot);
-		ret = dual_boot_set_boot_count(slot, 0);
-		if (ret)
-			printf("Warning: failed to reset boot count of image slot %u, error %d\n",
-			       slot, ret);
-	}
-
-	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
-		/* If we do not reserve rootfs_data, just recreate it */
-		remove_ubi_volume(rootfs_data);
-	} else {
-		vol = ubi_find_volume((char *)rootfs_data);
-	}
-
-	if (!vol) {
-		ret = create_ubi_volume(rootfs_data, 0, -1, true);
-	}
-
-	return ret;
+	/*
+	 * In A/B ITB mode U-Boot owns firmware recovery only. Per-slot overlay
+	 * volume creation and sizing are OpenWrt policy so they can evolve
+	 * without replacing the bootloader.
+	 */
+	(void)rootfs_data;
 #endif
 
-	ret = dual_boot_set_slot_invalid(slot, false, false);
+	ret = enetlite_ab_activate_trial(CONFIG_ENETLITE_AB_MAX_TRIES);
 	if (ret)
-		printf("Error: failed to set new image slot valid in env\n");
+		printf("Error: failed to activate A/B trial for slot %u (%d)\n",
+		       slot, ret);
 
-	ret = dual_boot_set_current_slot(slot);
-	if (ret)
-		printf("Error: failed to save new image slot to env\n");
+	return ret;
+}
 
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ENABLE_RETRY)) {
-		printf("Resetting boot count of image slot %u to 0\n", slot);
-		ret = dual_boot_set_boot_count(slot, 0);
-		if (ret)
-			printf("Warning: failed to reset boot count of image slot %u, error %d\n",
-			       slot, ret);
+static int mtd_dual_boot_post_recovery_install(u32 slot,
+					       const char *rootfs_data)
+{
+	int ret;
+
+#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
+	ret = mtd_dual_boot_ensure_rootfs_data(slot, rootfs_data, true);
+	if (ret) {
+		cprintln(ERROR,
+			 "*** A/B rootfs_data layout preparation failed, not confirming recovery install ***");
+		return ret;
 	}
+#else
+	/*
+	 * Recovery install restores a bootable firmware slot and a clean A/B env.
+	 * Linux preinit/provisioning creates missing rootfs_data/shared_data
+	 * volumes using OpenWrt-owned sizing policy.
+	 */
+	(void)rootfs_data;
+#endif
+
+	ret = enetlite_ab_init(slot, 1U << slot, true);
+	if (ret)
+		printf("Error: failed to initialize A/B env for recovery install slot %u (%d)\n",
+		       slot, ret);
 
 	return ret;
 }
@@ -1455,7 +1357,7 @@ static int write_ubi2_tar_image(const void *data, size_t size,
 	int ret;
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
-		slot = dual_boot_get_next_slot();
+		slot = enetlite_ab_get_inactive_slot();
 		printf("Upgrading image slot %u ...\n", slot);
 
 		kernel_part = dual_boot_slots[slot].kernel;
@@ -1473,6 +1375,13 @@ static int write_ubi2_tar_image(const void *data, size_t size,
 	ret = mount_ubi(mtd, UBI_MOUNT_RECREATE);
 	if (ret)
 		return ret;
+
+	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
+		ret = enetlite_ab_begin_install(ENETLITE_AB_OP_UPGRADE_OTHER,
+						enetlite_ab_get_confirmed_slot());
+		if (ret)
+			return ret;
+	}
 
 	/* Remove possibly existed firmware volume */
 	remove_ubi_volume(PART_FIT_NAME);
@@ -1504,12 +1413,31 @@ static int write_ubi_itb_image(const void *data, size_t size,
 			       struct mtd_info *mtd)
 {
 	const char *firmware_part, *rootfs_data_part;
-	u32 slot;
+	struct enetlite_ab_state ab_state;
+	u32 slot, confirmed_slot = 0;
+	bool recovery_install = false;
 	int ret;
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
-		slot = dual_boot_get_next_slot();
-		printf("Upgrading image slot %u ...\n", slot);
+		ret = enetlite_ab_state_load(&ab_state);
+		if (ret) {
+			recovery_install = true;
+			slot = 0;
+			printf("A/B recovery install: env is invalid (%d); writing slot 0 and reinitializing env after success\n",
+			       ret);
+		} else {
+			confirmed_slot = ab_state.confirmed_slot;
+			if (ab_state.state != ENETLITE_AB_STABLE) {
+				recovery_install = true;
+				slot = confirmed_slot;
+				printf("A/B recovery install: env state is %s; writing confirmed slot %u and reinitializing env after success\n",
+				       enetlite_ab_state_name(ab_state.state),
+				       slot);
+			} else {
+				slot = (confirmed_slot + 1) % DUAL_BOOT_MAX_SLOTS;
+				printf("Upgrading image slot %u ...\n", slot);
+			}
+		}
 
 		firmware_part = dual_boot_slots[slot].kernel;
 
@@ -1522,9 +1450,32 @@ static int write_ubi_itb_image(const void *data, size_t size,
 		rootfs_data_part = PART_ROOTFS_DATA_NAME;
 	}
 
-	ret = mount_ubi(mtd, UBI_MOUNT_RECREATE);
+	ret = mount_ubi(mtd, UBI_UPGRADE_RECREATE);
 	if (ret)
 		return ret;
+
+	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
+		if (recovery_install) {
+			/* Recovery install selected a slot before UBI attach. */
+		} else if (!ubi_find_volume((char *)dual_boot_slots[confirmed_slot].kernel)) {
+			recovery_install = true;
+			slot = confirmed_slot;
+			firmware_part = dual_boot_slots[slot].kernel;
+
+			if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA))
+				rootfs_data_part = PART_ROOTFS_DATA_NAME;
+			else
+				rootfs_data_part = dual_boot_slots[slot].rootfs_data;
+
+			printf("A/B recovery install: confirmed firmware volume %s is missing; writing slot %u and reinitializing env after success\n",
+			       firmware_part, slot);
+		} else {
+			ret = enetlite_ab_begin_install(ENETLITE_AB_OP_UPGRADE_OTHER,
+							confirmed_slot);
+			if (ret)
+				return ret;
+		}
+	}
 
 	/* Remove possibly existed kernel/rootfs volume */
 	remove_ubi_volume(PART_KERNEL_NAME);
@@ -1542,8 +1493,13 @@ static int write_ubi_itb_image(const void *data, size_t size,
 		if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
 			remove_ubi_volume(rootfs_data_part);
 #else
-		/* Remove this volume first in case of no enough PEBs */
-		remove_ubi_volume(rootfs_data_part);
+		/*
+		 * Remove this volume first in single-boot mode in case of not
+		 * enough PEBs. In A/B mode, rootfs_data topology is OpenWrt
+		 * policy and must not be resized by U-Boot.
+		 */
+		if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
+			remove_ubi_volume(rootfs_data_part);
 #endif
 	}
 
@@ -1569,8 +1525,13 @@ static int write_ubi_itb_image(const void *data, size_t size,
 	if (ret)
 		return ret;
 
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
+	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
+		if (recovery_install)
+			return mtd_dual_boot_post_recovery_install(slot,
+								   rootfs_data_part);
+
 		return mtd_dual_boot_post_upgrade(slot, rootfs_data_part);
+	}
 
 	return create_ubi_volume(rootfs_data_part, 0, -1, true);
 }
@@ -1638,14 +1599,9 @@ static int ubi_boot_verify(const struct dual_boot_slot *slot, ulong loadaddr)
 	return 0;
 }
 
-static int ubi_set_fdtargs_dual_boot(void)
+static int ubi_set_fdtargs_dual_boot(u32 slot)
 {
-	const char *rootfs_data;
-	u32 slot;
 	int ret;
-
-	/* Current slot for booting */
-	slot = dual_boot_get_current_slot();
 
 	snprintf(fitvol, sizeof(fitvol), "0,%s", dual_boot_slots[slot].kernel);
 
@@ -1653,68 +1609,12 @@ static int ubi_set_fdtargs_dual_boot(void)
 	if (ret)
 		return ret;
 
-	ret = fdtargs_set("mediatek,boot-firmware-part",
-			  dual_boot_slots[slot].kernel);
-	if (ret)
-		return ret;
-
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA))
-		rootfs_data = PART_ROOTFS_DATA_NAME;
-	else
-		rootfs_data = dual_boot_slots[slot].rootfs_data;
-
-	ret = fdtargs_set("mediatek,boot-rootfs_data-part", rootfs_data);
-	if (ret)
-		return ret;
-
-	/* Next slot for upgrading */
-	slot = dual_boot_get_next_slot();
-
-	ret = fdtargs_set("mediatek,upgrade-firmware-part",
-			  dual_boot_slots[slot].kernel);
-	if (ret)
-		return ret;
-
-	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA))
-		rootfs_data = PART_ROOTFS_DATA_NAME;
-	else
-		rootfs_data = dual_boot_slots[slot].rootfs_data;
-
-	ret = fdtargs_set("mediatek,upgrade-rootfs_data-part", rootfs_data);
-	if (ret)
-		return ret;
-
-#ifdef CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE
-	snprintf(rootfs_data_size_limit, sizeof(rootfs_data_size_limit),
-		 "%llu",
-		 (unsigned long long)dual_boot_rootfs_data_size_bytes());
-
-	ret = fdtargs_set("mediatek,rootfs_data-size-limit",
-			  rootfs_data_size_limit);
-	if (ret)
-		return ret;
-
-	ret = fdtargs_set("mediatek,shared-data-volume",
-			  PART_SHARED_DATA_NAME);
-	if (ret)
-		return ret;
-
-	snprintf(shared_data_size_limit, sizeof(shared_data_size_limit),
-		 "%llu",
-		 (unsigned long long)dual_boot_shared_data_size_bytes());
-
-	ret = fdtargs_set("mediatek,shared-data-size-limit",
-			  shared_data_size_limit);
-	if (ret)
-		return ret;
-#endif
-
 #ifdef CONFIG_MTK_DUAL_BOOT_ITB_IMAGE
 #ifdef CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA
 #if !defined(CONFIG_MTK_DUAL_BOOT_SHARED_ROOTFS_DATA) || !defined(CONFIG_MTK_DUAL_BOOT_ROOTFS_DATA_SIZE)
 #error Reserving rootfs_data can only be enabled for shared rootfs_data with fixed size!
 #endif
-	ret = fdtargs_set("mediatek,reserve-rootfs_data", NULL);
+	ret = fdtargs_set("enetlite,reserve-rootfs_data", NULL);
 	if (ret)
 		return ret;
 #endif
@@ -1729,7 +1629,7 @@ static int ubi_set_bootargs(void)
 	u32 slot;
 	int ret;
 
-	slot = dual_boot_get_current_slot();
+	slot = enetlite_ab_get_confirmed_slot();
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
 		ret = bootargs_set("boot_param.reserve_rootfs_data", NULL);
@@ -1769,7 +1669,7 @@ static int ubi_set_bootargs(void)
 	if (ret)
 		return ret;
 
-	slot = dual_boot_get_next_slot();
+	slot = enetlite_ab_get_inactive_slot();
 
 	ret = bootargs_set("boot_param.upgrade_kernel_part",
 			   dual_boot_slots[slot].kernel);
@@ -1837,7 +1737,7 @@ static int mtd_dual_boot_slot(struct dual_boot_priv *priv, u32 slot,
 	fdtargs_reset();
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ITB_IMAGE))
-		ubi_set_fdtargs_dual_boot();
+		ubi_set_fdtargs_dual_boot(slot);
 	else
 		ubi_set_bootargs();
 
