@@ -74,8 +74,8 @@ struct enetlite_ab_boot_decision {
 };
 
 void dual_boot_disable(void);
-u32 enetlite_ab_get_confirmed_slot(void);
-u32 enetlite_ab_get_inactive_slot(void);
+int enetlite_ab_get_confirmed_slot(u32 *slot);
+int enetlite_ab_get_inactive_slot(u32 *slot);
 
 int dual_boot_set_defaults(void *fdt);
 

@@ -681,21 +681,38 @@ int enetlite_ab_start_manual_trial(u32 target_slot)
 	return 0;
 }
 
-u32 enetlite_ab_get_confirmed_slot(void)
+int enetlite_ab_get_confirmed_slot(u32 *slot)
 {
 	struct enetlite_ab_state state;
+	int ret;
 
-	if (enetlite_ab_state_load(&state))
-		return 0;
+	if (!slot)
+		return -EINVAL;
 
-	return state.confirmed_slot;
+	ret = enetlite_ab_state_load(&state);
+	if (ret)
+		return ret;
+
+	*slot = state.confirmed_slot;
+
+	return 0;
 }
 
-u32 enetlite_ab_get_inactive_slot(void)
+int enetlite_ab_get_inactive_slot(u32 *slot)
 {
-	u32 confirmed_slot = enetlite_ab_get_confirmed_slot();
+	u32 confirmed_slot;
+	int ret;
 
-	return (confirmed_slot + 1) % DUAL_BOOT_MAX_SLOTS;
+	if (!slot)
+		return -EINVAL;
+
+	ret = enetlite_ab_get_confirmed_slot(&confirmed_slot);
+	if (ret)
+		return ret;
+
+	*slot = (confirmed_slot + 1) % DUAL_BOOT_MAX_SLOTS;
+
+	return 0;
 }
 
 static int enetlite_ab_boot_slot(struct dual_boot_priv *priv,

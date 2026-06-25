@@ -42,8 +42,13 @@ static int wpsslot_switch_to_next_slot(void)
 	if (ret != -ENOENT)
 		return ret;
 
-	confirmed_slot = enetlite_ab_get_confirmed_slot();
-	target_slot = enetlite_ab_get_inactive_slot();
+	ret = enetlite_ab_get_confirmed_slot(&confirmed_slot);
+	if (ret)
+		return ret;
+
+	ret = enetlite_ab_get_inactive_slot(&target_slot);
+	if (ret)
+		return ret;
 
 	printf("WPS/Mesh recovery: switching A/B slot %u -> %u\n",
 	       confirmed_slot, target_slot);

@@ -1357,7 +1357,10 @@ static int write_ubi2_tar_image(const void *data, size_t size,
 	int ret;
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
-		slot = enetlite_ab_get_inactive_slot();
+		ret = enetlite_ab_get_inactive_slot(&slot);
+		if (ret)
+			return ret;
+
 		printf("Upgrading image slot %u ...\n", slot);
 
 		kernel_part = dual_boot_slots[slot].kernel;
@@ -1377,8 +1380,12 @@ static int write_ubi2_tar_image(const void *data, size_t size,
 		return ret;
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT)) {
+		ret = enetlite_ab_get_confirmed_slot(&slot);
+		if (ret)
+			return ret;
+
 		ret = enetlite_ab_begin_install(ENETLITE_AB_OP_UPGRADE_OTHER,
-						enetlite_ab_get_confirmed_slot());
+						slot);
 		if (ret)
 			return ret;
 	}
@@ -1629,7 +1636,9 @@ static int ubi_set_bootargs(void)
 	u32 slot;
 	int ret;
 
-	slot = enetlite_ab_get_confirmed_slot();
+	ret = enetlite_ab_get_confirmed_slot(&slot);
+	if (ret)
+		return ret;
 
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
 		ret = bootargs_set("boot_param.reserve_rootfs_data", NULL);
@@ -1669,7 +1678,9 @@ static int ubi_set_bootargs(void)
 	if (ret)
 		return ret;
 
-	slot = enetlite_ab_get_inactive_slot();
+	ret = enetlite_ab_get_inactive_slot(&slot);
+	if (ret)
+		return ret;
 
 	ret = bootargs_set("boot_param.upgrade_kernel_part",
 			   dual_boot_slots[slot].kernel);
