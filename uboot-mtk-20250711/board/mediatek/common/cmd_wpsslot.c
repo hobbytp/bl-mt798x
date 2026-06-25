@@ -31,6 +31,14 @@ static int wpsslot_switch_to_next_slot(void)
 		return 0;
 	}
 
+	if (ret == -EBUSY) {
+		ret = enetlite_ab_abort_install();
+		if (ret)
+			return ret;
+		printf("WPS/Mesh recovery: interrupted A/B install aborted; confirmed slot will boot\n");
+		return 0;
+	}
+
 	if (ret != -ENOENT)
 		return ret;
 

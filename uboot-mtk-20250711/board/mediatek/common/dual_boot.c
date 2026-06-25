@@ -242,6 +242,14 @@ static void enetlite_ab_set_last_decision(
 		last_decision.boot_path = ENETLITE_AB_BOOT_PATH_RECOVERY;
 	else
 		last_decision.boot_path = ENETLITE_AB_BOOT_PATH_SLOT;
+
+	if (reason == ENETLITE_AB_REASON_INVALID_STATE) {
+		last_decision.confirmed_slot = 0;
+		last_decision.good_mask = 0;
+		last_decision.target_slot = -1;
+		last_decision.operation = ENETLITE_AB_OP_NONE;
+		last_decision.tries_left = -1;
+	}
 	last_decision_valid = true;
 }
 
@@ -611,7 +619,10 @@ int enetlite_ab_cancel_trial(void)
 	case ENETLITE_AB_INSTALLING:
 		return -EBUSY;
 	case ENETLITE_AB_TRIAL:
-		state.tries_left = 0;
+		state.state = ENETLITE_AB_STABLE;
+		state.target_slot = -1;
+		state.operation = ENETLITE_AB_OP_NONE;
+		state.tries_left = -1;
 		return enetlite_ab_state_commit(&state);
 	default:
 		return -EINVAL;
